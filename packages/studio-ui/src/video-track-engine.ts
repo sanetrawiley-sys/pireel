@@ -53,7 +53,7 @@ export interface EngineSeg {
 export interface EngineAudioClip {
   id: string;
   url: string;
-  /** Playback speed (element playbackRate; preservesPitch=false so preview matches the export's resample). */
+  /** Playback speed (element playbackRate; preservesPitch stays ON — the export runs a pitch-preserving stretch too). */
   speed: number;
   /** Full envelope at edited time t (level × fades); 0 outside the clip's window, may exceed 1 (boost). */
   gainAt: (t: number) => number;
@@ -96,6 +96,16 @@ export interface FrameInfo {
 }
 
 const EPS = 0.04;
+
+/** Removing a playing media element from the DOM does not reliably stop its audio. Pause it before
+ * releasing the node so a transient preview respec cannot leave an orphan narration playing beside
+ * the replacement element. Source swaps reuse the resident decoder and let assigning the new src
+ * stop the old resource; this helper is only for permanent removal. */
+function releaseMediaElement(el: HTMLMediaElement): void {
+  if (!el.paused) el.pause();
+  el.removeAttribute('src');
+  el.remove();
+}
 
 export class VideoTrackEngine {
   private host: HTMLDivElement | null = null;
@@ -143,9 +153,6 @@ export class VideoTrackEngine {
   // source, its decode element is force-muted and the dub carries the sound in SOURCE seconds — lip-sync
   // matters here, so drift correction is tight (0.08s) against the video element's own clock.
   private dubs = new Map<string, { el: HTMLAudioElement; url: string }>();
-  // Solo monitoring: while an audio clip is soloed the footage's own sound is silenced in preview only
-  // (see setMonitorMuteVideo) — this never enters the composition and never reaches the export mixer.
-  private monitorMuteVideo = false;
   // Per-element gain nodes for the VIDEO/dub side, created only when a level above source is asked for
   // (see setElGain). Keyed by element so a recreated element simply gets a fresh chain.
   private elGains = new WeakMap<HTMLMediaElement, { el: HTMLMediaElement; gain?: GainNode }>();
@@ -184,13 +191,13 @@ export class VideoTrackEngine {
       if (prev) {
         this.bitmapModes.delete(prev);
         this.bitmapStages.delete(prev);
-        prev.remove();
+        releaseMediaElement(prev);
         this.els.delete(key);
       }
       for (const side of ['pre', 'post'] as const) {
         const gDrop = this.ghosts.get(`${key}::${side}`);
         if (gDrop) {
-          gDrop.remove();
+          releaseMediaElement(gDrop);
           this.ghosts.delete(`${key}::${side}`);
           if (this.activeGhost === gDrop) this.activeGhost = null;
         }
@@ -221,7 +228,7 @@ export class VideoTrackEngine {
       for (const side of ['pre', 'post'] as const) {
         const gStale = this.ghosts.get(`${key}::${side}`);
         if (gStale) {
-          gStale.remove();
+          releaseMediaElement(gStale);
           this.ghosts.delete(`${key}::${side}`);
           if (this.activeGhost === gStale) this.activeGhost = null;
         }
@@ -314,26 +321,10 @@ export class VideoTrackEngine {
   private segGain(i: number, tEdited?: number): number {
     const seg = this.segs[i];
     if (!seg) return 1;
-    if (this.monitorMuteVideo) return 0;
     const base = seg.gain == null ? 1 : Math.max(0, seg.gain); // >1 is a real boost — setElGain routes it
     if (!seg.fadeAt || base <= 0) return base;
     const local = (tEdited ?? this.tEdited) - (this.starts[i] ?? 0);
     return Math.max(0, base * seg.fadeAt(local));
-  }
-
-  /** Monitoring-only footage mute (an audio clip is soloed): silences the video track's own sound in
-   *  PREVIEW without touching the composition — nothing here reaches the export mixer. Applied inside
-   *  segGain, so every writer (activation, roll-through, per-tick fades, dub) picks it up. */
-  setMonitorMuteVideo(on: boolean): void {
-    if (this.monitorMuteVideo === on) return;
-    this.monitorMuteVideo = on;
-    const seg = this.segs[this.curIdx];
-    if (!seg) return;
-    const g = this.segGain(this.curIdx);
-    const el = this.els.get(seg.key);
-    if (el) this.setElGain(el, g); // paused too: no tick would come to apply it
-    const dub = this.dubs.get(seg.key);
-    if (dub) this.setElGain(dub.el, g);
   }
 
   /** Cut transition table (film seconds): inside the window, pushFrame carries the "other side" ghost frame (frame2). */
@@ -348,7 +339,7 @@ export class VideoTrackEngine {
     for (const [id, c] of this.audioClips) {
       if (!keep.has(id)) {
         c.gain?.disconnect();
-        c.el.remove();
+        releaseMediaElement(c.el);
         this.audioClips.delete(id);
       }
     }
@@ -381,11 +372,23 @@ export class VideoTrackEngine {
     const cur = this.dubs.get(key);
     if (!url) {
       if (cur) {
-        cur.el.remove();
+        releaseMediaElement(cur.el);
         this.dubs.delete(key);
       }
-      // hand the sound back to the decode element on the next activate/seek
-      if (!this.playing) this.seek(this.tEdited);
+      // hand the sound back to the decode element: stopped → the next activate/seek does it;
+      // playing → un-mute the active element NOW, or the source stays silent until the next
+      // segment change (turning denoise off mid-playback used to cut the sound entirely).
+      if (!this.playing) {
+        this.seek(this.tEdited);
+        return;
+      }
+      const active = this.segs[this.curIdx];
+      const el = active && active.key === key ? this.els.get(key) : undefined;
+      if (el) {
+        el.muted = false;
+        this.setElGain(el, this.segGain(this.curIdx));
+        if (el.paused) el.play().catch(() => {});
+      }
       return;
     }
     if (cur?.url === url) return;
@@ -415,7 +418,7 @@ export class VideoTrackEngine {
     if (!dub) return false;
     this.setElGain(dub.el, gain);
     dub.el.playbackRate = videoEl.playbackRate;
-    (dub.el as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = false;
+    (dub.el as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true; // same rule as the decode element: speed keeps the voice's pitch
     if (!dub.el.seeking && Math.abs(dub.el.currentTime - videoEl.currentTime) > 0.08) {
       try {
         dub.el.currentTime = videoEl.currentTime;
@@ -471,7 +474,7 @@ export class VideoTrackEngine {
   }
 
   /** Per-tick / on-seek clip sync: volume from the envelope closure, playbackRate = speed with
-   *  preservesPitch OFF (matches the export resample); drift correction only past 0.35s. force = hard seek. */
+   *  preservesPitch ON (the export stretches pitch-preserving too); drift correction only past 0.35s. force = hard seek. */
   private syncAudioClips(t: number, wantPlay: boolean, force = false): void {
     if (wantPlay && this.actx?.state === 'suspended') void this.actx.resume(); // play is a user gesture
     for (const entry of this.audioClips.values()) {
@@ -493,7 +496,7 @@ export class VideoTrackEngine {
       }
       setGain(spec.gainAt(t));
       el.playbackRate = spec.speed;
-      (el as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = false;
+      (el as HTMLAudioElement & { preservesPitch?: boolean }).preservesPitch = true;
       if ((force || Math.abs(el.currentTime - srcT) > 0.35) && !el.seeking) {
         try {
           el.currentTime = srcT;
@@ -655,6 +658,8 @@ export class VideoTrackEngine {
     if (!el) return;
     const rate = segmentSourceRate(this.segs[i]!, this.starts[i]!, this.ends[i]!);
     el.playbackRate = rate > 1e-9 ? rate : 1;
+    // Explicit: a retimed shot keeps the speaker's pitch here AND in the export (time-stretch.ts)
+    (el as HTMLVideoElement & { preservesPitch?: boolean }).preservesPitch = true;
     try {
       el.currentTime = Math.max(0, srcT);
     } catch {
@@ -993,15 +998,15 @@ export class VideoTrackEngine {
     this.pause();
     for (const c of this.audioClips.values()) {
       c.gain?.disconnect();
-      c.el.remove();
+      releaseMediaElement(c.el);
     }
     this.audioClips.clear();
     void this.actx?.close().catch(() => {});
     this.actx = null;
-    for (const d of this.dubs.values()) d.el.remove();
+    for (const d of this.dubs.values()) releaseMediaElement(d.el);
     this.dubs.clear();
-    for (const el of this.els.values()) el.remove();
-    for (const g of this.ghosts.values()) g.remove();
+    for (const el of this.els.values()) releaseMediaElement(el);
+    for (const g of this.ghosts.values()) releaseMediaElement(g);
     for (const u of this.urls.values()) URL.revokeObjectURL(u);
     this.els.clear();
     this.ghosts.clear();

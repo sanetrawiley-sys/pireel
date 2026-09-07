@@ -21,6 +21,7 @@ ensureTemplatesRegistered();
 
 export * from './audio-tracks';
 export * from './caption-presets';
+export * from './display-text-presets';
 export * from './caption-layout-metrics';
 export * from './caption-layout-state';
 export * from './composition-core';
@@ -43,7 +44,6 @@ export * from './media-framing-edit';
 export * from './media-video-edit';
 export * from './generated-draft-document-edit';
 export * from './project-document';
-export * from './transcript-address';
 export * from './transcript-context';
 export * from './local-asset-locator';
 export * from './templates';

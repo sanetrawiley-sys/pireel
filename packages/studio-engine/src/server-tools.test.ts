@@ -61,7 +61,7 @@ describe('离线执行器(标签页关着时的 MCP fallback)', () => {
     expect(r.result.state).toContain('stable id output-main');
     expect(r.comp).toBeUndefined(); // 纯查询不落库
   });
-  it('离线 MCP 也能保存整片方案并渐进持久化开放式 Scene 设计', () => {
+  it('离线 MCP 保留旧规划文档的读写兼容性，但不再注入全局状态', () => {
     const p = v2proj();
     const planned = runServerTool('set_director_plan', {
       goal: 'Teach one idea.', creativeThesis: 'Source and explanation become one field.', rhythmArc: 'Establish, build, hold.',
@@ -89,8 +89,8 @@ describe('离线执行器(标签页关着时的 MCP fallback)', () => {
     const read = runServerTool('read_scene_designs', {}, { ...designedProject, document: designed.document! });
     expect(read.result).toMatchObject({ ok: true, data: { path: 'scene-designs.md' } });
     const state = runServerTool('get_state', {}, { ...designedProject, document: designed.document! });
-    expect(state.result.state).toContain('Director Plan saved as director-plan.md');
-    expect(state.result.state).toContain('Authored Scene designs saved as scene-designs.md for 1 Scene(s): lesson');
+    expect(state.result.state).not.toContain('Director Plan saved as director-plan.md');
+    expect(state.result.state).not.toContain('Authored Scene designs saved as scene-designs.md');
     expect(SERVER_EXECUTABLE_TOOLS.has('set_director_plan')).toBe(true);
     expect(SERVER_EXECUTABLE_TOOLS.has('set_scene_designs')).toBe(true);
   });
@@ -634,6 +634,14 @@ describe('离线执行器(标签页关着时的 MCP fallback)', () => {
     const r2 = runServerTool('set_captions', { preset: 'ln-clean' }, proj({ transcript: [] }));
     expect(r2.result.ok).toBe(false);
   });
+  it('set_captions:9:16 画布全局约束字幕基线', () => {
+    const r = runServerTool('set_captions', {
+      preset: 'ln-clean',
+      yPct: 81,
+    }, proj());
+    expect(r.result.ok).toBe(true);
+    expect(r.comp!.captionStyle?.yPct).toBe(72);
+  });
   it('V2 set_captions/remove_captions 原子维护样式和 managed lane', () => {
     const p = v2proj();
     p.document!.timeline.tracks.push({
@@ -643,7 +651,7 @@ describe('离线执行器(标签页关着时的 MCP fallback)', () => {
     const enabled = runServerTool('set_captions', { preset: 'ln-clean', yPct: 80, scale: 1.2 }, p);
     expect(enabled.result.ok).toBe(true);
     const captionTrackId = enabled.document!.semantics.managedCaptionTrackId!;
-    expect(enabled.document?.appearance.captionStyle).toMatchObject({ on: true, preset: 'ln-clean', yPct: 80, scale: 1.2 });
+    expect(enabled.document?.appearance.captionStyle).toMatchObject({ on: true, preset: 'ln-clean', yPct: 72, scale: 1.2 });
     expect(enabled.document?.timeline.tracks.find((track) => track.id === captionTrackId)!.clips.length).toBeGreaterThan(0);
     expect(enabled.document?.timeline.tracks.find((track) => track.id === 'empty-graphics')).toMatchObject({
       hidden: true, syncLocked: false, stackOrder: 8, clips: [],
@@ -691,12 +699,12 @@ describe('离线执行器(标签页关着时的 MCP fallback)', () => {
     const rejected = runServerTool('set_captions', { yPct: 70 }, lockedProject);
     expect(rejected.result).toMatchObject({ ok: false, data: { code: 'track-locked' } });
     expect(rejected.document).toBeUndefined();
-    expect(lockedProject.document.appearance.captionStyle?.yPct).toBe(80);
+    expect(lockedProject.document.appearance.captionStyle?.yPct).toBe(72);
 
     lockedProject.document.timeline.tracks.find((track) => track.id === captionTrackId)!.locked = false;
     const removed = runServerTool('remove_captions', {}, lockedProject);
     expect(removed.result.ok).toBe(true);
-    expect(removed.document?.appearance.captionStyle).toMatchObject({ on: false, preset: 'ln-clean', yPct: 80 });
+    expect(removed.document?.appearance.captionStyle).toMatchObject({ on: false, preset: 'ln-clean', yPct: 72 });
     expect(removed.document?.timeline.tracks.find((track) => track.id === captionTrackId)).toMatchObject({ clips: [] });
   });
   it('set_video_filter:整镜调色,值替换整份;全中性=字段摘掉;关键帧进 vid 时间轴体', () => {
@@ -894,6 +902,13 @@ describe('离线执行器(标签页关着时的 MCP fallback)', () => {
     expect(r2.result.ok).toBe(true);
     expect((r2.result.data as { block: { id: string } }).block.id).toBe('b1');
   });
+  it('apply_block 与站内生成共享最小字号硬约束', () => {
+    const raw = '小字\n```html\n<div data-edit="t">Too small</div><style>#small-type .t{font-size:18px}</style>\n```\n```js\n\n```';
+    const result = runServerTool('apply_block', { raw, blockId: 'small-type', atSec: 1 }, proj());
+    expect(result.result.ok).toBe(false);
+    expect(result.result.data).toMatchObject({ blockId: 'small-type' });
+    expect((result.result.data as { issues: string[] }).issues.join(' ')).toContain('24px');
+  });
   it('compose_context 按 atSec 读取长视频当前位置，而不是固定取文稿开头', () => {
     const transcript = Array.from({ length: 80 }, (_, index) => ({
       start: index * 10,
@@ -1015,3 +1030,26 @@ describe('apply_block:kit 契约答案(离线执行器)', () => {
     expect(String((r3.result as { error?: string }).error)).toContain('sparkline');
   });
 });
+
+describe('v3 receipts (receipt: "v3")', () => {
+  it('get_state returns the v3 shape and mutations carry a document delta in frames', () => {
+    const p = proj({ receipt: 'v3' });
+    const state = runServerTool('get_state', {}, p);
+    expect(state.result.ok).toBe(true);
+    const data = state.result.data as { canvas: { fps: number }; durationFrames: number; tracks: Array<{ id: string; clips?: Array<{ frames: [number, number] }> }>; offline: boolean };
+    expect(data.canvas.fps).toBeGreaterThan(0);
+    expect(data.offline).toBe(true);
+    expect(data.durationFrames).toBeGreaterThan(0);
+    expect(data.tracks.some((track) => track.clips?.some((clip) => Array.isArray(clip.frames) && clip.frames.length === 2))).toBe(true);
+    expect(JSON.stringify(data)).not.toMatch(/"shots"|"blocks"|startSec/);
+
+    const cut = runServerTool('cut_range', { fromSec: 0, toSec: 2 }, p);
+    expect(cut.result.ok).toBe(true);
+    const delta = (cut.result.data as { delta: { durationFrames?: [number, number]; clips?: unknown[]; shifted?: unknown[]; notes?: string[] } }).delta;
+    expect(delta.durationFrames).toBeDefined();
+    expect(delta.durationFrames![1]).toBeLessThan(delta.durationFrames![0]);
+    expect((delta.clips?.length ?? 0) + (delta.shifted?.length ?? 0)).toBeGreaterThan(0);
+    expect(JSON.stringify(delta)).not.toMatch(/shotsUpdated|blocksShifted|fromSec/);
+  });
+});
+

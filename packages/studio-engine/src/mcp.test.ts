@@ -11,8 +11,10 @@ import {
 function deps(overrides: Partial<McpDeps> = {}): McpDeps {
   return {
     skillVersion: '2099-01-01.1',
-    callBridge: vi.fn(async () => ({ ok: true, summary: 'done' })),
+    callBridge: vi.fn(async (tool: string) => (tool === 'run_v3' ? { ok: false, error: 'studio_not_open' } : { ok: true, summary: 'done' })),
     listFrames: vi.fn(() => [{ id: 'f1', title: 'F1', summary: 's' }]),
+    listSkills: vi.fn(async () => ({ ok: true, summary: '1 skill', data: { skills: [{ id: 'usk_1', title: '大女主' }] } })),
+    readSkill: vi.fn(async (id: string) => ({ ok: true, summary: id, data: { skill: { id, playbook: 'PB' } } })),
     readFrame: vi.fn((id: string) => ({ ok: true, summary: id, data: { playbook: 'PB' } })),
     readEditingGuide: vi.fn(() => ({ ok: true, data: { guide: 'G' } })),
     assembleComposeBrief: vi.fn((_d: Record<string, unknown>, instruction: string) => ({ ok: true, data: { system: 'SYS', prompt: `P:${instruction}` } })),
@@ -31,6 +33,7 @@ function deps(overrides: Partial<McpDeps> = {}): McpDeps {
     generateImage: vi.fn(async () => ({ ok: true, summary: 'image started', data: { id: 'ci1', status: 'pending' } })),
     generateVideo: vi.fn(async () => ({ ok: true, summary: 'video started', data: { id: 'cv1', status: 'pending' } })),
     generateMusic: vi.fn(async () => ({ ok: true, summary: 'music generated', data: { asset: { id: 'cm1', url: 'https://cdn.example/m.wav' } } })),
+    generateSfx: vi.fn(async () => ({ ok: true, summary: 'sfx generated', data: { asset: { id: 'cs1', url: 'https://cdn.example/s.mp3' } } })),
     getGenerationJobs: vi.fn(async () => ({ ok: true, summary: '2 generation jobs', data: { jobs: [] } })),
     listVoices: vi.fn(async () => ({ ok: true, summary: '2 voices', data: { voices: [] } })),
     cloneVoice: vi.fn(async () => ({ ok: true, summary: 'voice created', data: { voice: { id: 'voice_1' } } })),
@@ -42,14 +45,94 @@ function deps(overrides: Partial<McpDeps> = {}): McpDeps {
   };
 }
 
+describe('MCP v3 surface', () => {
+  const v3ctx = async () => ({ fps: 30, kindOf: (id: string) => (id.startsWith('g') ? 'graphic' as const : id.startsWith('a') ? 'audio' as const : 'narrative' as const) });
+
+  it('lists the consolidated tools only when the session speaks v3', async () => {
+    const legacy = await handleMcpRequest({ id: 1, method: 'tools/list' }, deps());
+    const v3 = await handleMcpRequest({ id: 2, method: 'tools/list' }, deps({ agentSurface: 'v3', resolveV3Context: v3ctx }));
+    const legacyNames = (legacy!.result as { tools: { name: string }[] }).tools.map((t) => t.name);
+    const v3Names = (v3!.result as { tools: { name: string }[] }).tools.map((t) => t.name);
+    expect(legacyNames).toContain('set_shot_treatment');
+    expect(v3Names).not.toContain('set_shot_treatment');
+    expect(v3Names).toEqual(expect.arrayContaining(['get_state', 'set_clip_framing', 'ripple_delete_ranges', 'manage_project']));
+    expect(v3Names).not.toContain('generate_foley'); // chat-only stays off MCP
+    expect(v3Names.length).toBe(48); // 50 minus the three chat-only tools
+  });
+
+  it('sends v3 calls to the live tab as one run_v3 bridge call when a tab is open', async () => {
+    const callBridge = vi.fn(async () => ({ ok: true, summary: 'moved', data: { steps: [], delta: { shifted: [] } } }));
+    const d = deps({ agentSurface: 'v3', resolveV3Context: v3ctx, callBridge });
+    await handleMcpRequest({ id: 30, method: 'tools/call', params: { name: 'move_clips', arguments: { items: [{ clipId: 'n1', startFrame: 90 }] } } }, d);
+    expect(callBridge).toHaveBeenCalledTimes(1);
+    expect(callBridge).toHaveBeenCalledWith('run_v3', { name: 'move_clips', args: { items: [{ clipId: 'n1', startFrame: 90 }] } }, expect.any(Number));
+  });
+
+  it('translates frame-based v3 calls onto legacy seconds and routes by clip kind', async () => {
+    const d = deps({ agentSurface: 'v3', resolveV3Context: v3ctx });
+    const response = await handleMcpRequest({ id: 3, method: 'tools/call', params: { name: 'move_clips', arguments: { items: [{ clipId: 'n1', startFrame: 90 }, { clipId: 'g1', startFrame: 120 }] } } }, d);
+    expect(d.callBridge).toHaveBeenNthCalledWith(1, 'run_v3', expect.anything(), expect.any(Number));
+    expect(d.callBridge).toHaveBeenNthCalledWith(2, 'move_clips', { items: [{ clipId: 'n1', startSec: 3 }] }, expect.any(Number));
+    expect(d.callBridge).toHaveBeenNthCalledWith(3, 'move_block', { blockId: 'g1', startSec: 4 }, expect.any(Number));
+    const body = JSON.parse((response!.result as { content: { text: string }[] }).content[0]!.text) as { ok: boolean; data: { steps: unknown[] } };
+    expect(body.ok).toBe(true);
+    expect(body.data.steps).toHaveLength(2);
+  });
+
+  it('chains a stock import into register_media using the previous result', async () => {
+    const d = deps({ agentSurface: 'v3', resolveV3Context: v3ctx });
+    const payload = { query: 'city night', kind: 'video', page: 1, limit: 12, assetId: 'px_1' };
+    await handleMcpRequest({ id: 4, method: 'tools/call', params: { name: 'register_media', arguments: { stock: payload } } }, d);
+    expect(d.importStock).toHaveBeenCalledWith(payload);
+    expect(d.callBridge).toHaveBeenCalledWith('register_media', { assets: [{ id: 'up_1', kind: 'image', url: 'https://cdn.example/stock.jpg' }] }, expect.any(Number));
+  });
+
+  it('returns the adapter error shape and never calls the engine on bad input', async () => {
+    const d = deps({ agentSurface: 'v3' });
+    const response = await handleMcpRequest({ id: 5, method: 'tools/call', params: { name: 'ripple_delete_ranges', arguments: { ranges: [[30, 60]] } } }, d);
+    const body = JSON.parse((response!.result as { content: { text: string }[] }).content[0]!.text) as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: false, error: 'fps_unavailable' });
+    expect((d.callBridge as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[0])).toEqual(['run_v3']);
+    expect((response!.result as { isError: boolean }).isError).toBe(true);
+  });
+
+  it('stops a multi-step call at the first failure and reports what was applied', async () => {
+    const callBridge = vi.fn(async (tool: string) => (tool === 'run_v3' ? { ok: false, error: 'studio_not_open' } : tool === 'delete_blocks' ? { ok: true, summary: 'blocks gone' } : { ok: false, error: 'locked track' }));
+    const d = deps({ agentSurface: 'v3', resolveV3Context: v3ctx, callBridge });
+    const response = await handleMcpRequest({ id: 6, method: 'tools/call', params: { name: 'remove_clips', arguments: { clipIds: ['g1', 'n1'] } } }, d);
+    const body = JSON.parse((response!.result as { content: { text: string }[] }).content[0]!.text) as { ok: boolean; error: string; detail: string; data: { steps: { tool: string; ok: boolean }[] } };
+    expect(body.ok).toBe(false);
+    expect(body.error).toBe('locked track');
+    expect(body.detail).toContain('after 1 completed step');
+    expect(body.data.steps.map((step) => [step.tool, step.ok])).toEqual([['delete_blocks', true], ['remove_clips', false]]);
+  });
+
+  it('keeps legacy names working when the session is not on v3', async () => {
+    const d = deps();
+    await handleMcpRequest({ id: 7, method: 'tools/call', params: { name: 'move_clips', arguments: { items: [{ clipId: 'n1', startSec: 3 }] } } }, d);
+    expect(d.callBridge).toHaveBeenCalledWith('move_clips', { items: [{ clipId: 'n1', startSec: 3 }] }, expect.any(Number));
+  });
+});
+
 describe('MCP 工具面', () => {
   it('STUDIO_TOOLS 全量映射 + MCP 专属工具(registry 加工具这里自动长出来)', () => {
     const names = new Set(buildMcpTools().map((t) => t.name));
     // chatOnly 工具(review_visuals 这类托管视觉模型)不出现在 MCP 面——外部 agent 通过 capture_frame/review_sequence 使用自己的眼睛
     for (const d of STUDIO_TOOLS) expect(names.has(d.id)).toBe(!d.chatOnly);
-    for (const extra of ['get_state', 'list_frames', 'compose_block_brief', 'apply_block', 'review_sequence', 'get_icons', 'search_stock', 'import_stock']) {
+    for (const extra of ['get_state', 'list_frames', 'list_skills', 'read_skill', 'compose_block_brief', 'apply_block', 'review_sequence', 'get_icons', 'search_stock', 'import_stock']) {
       expect(names.has(extra)).toBe(true);
     }
+  });
+  it('私有/community Skill 通过稳定的目录与正文接口暴露，不把内部实现当契约', () => {
+    const tools = buildMcpTools();
+    const list = tools.find((tool) => tool.name === 'list_skills')!;
+    const read = tools.find((tool) => tool.name === 'read_skill')!;
+    expect(list.description).toContain('private author-owned Skills');
+    expect(list.description).toContain('never private playbook text');
+    expect((read.inputSchema as { required?: string[] }).required).toContain('skill_id');
+    expect(read.description).toContain('stable Skill boundary');
+    expect(read.description).toContain('list_voices');
+    expect(read.description).not.toContain('editorialOpeningEvidence');
   });
   it('自家 LLM 收费工具在 MCP 面标注 credits 警示并指到 BYO 流(商业模式:编排+文本生成走用户订阅)', () => {
     const tools = buildMcpTools();
@@ -75,7 +158,8 @@ describe('MCP 工具面', () => {
     expect(design.description).toContain('customVoiceAccess.designCredits');
     expect(design.description).toContain('explicit approval');
     expect((design.inputSchema as { required?: string[] }).required).toContain('prompt');
-    expect(speech.description).toContain('exact approved text');
+    expect(speech.description).toContain('exact approved clean text');
+    expect(speech.description).toContain('The runtime compiles those controls only for synthesis');
   });
   it('description 不引用 MCP 语境里不存在的机制(frame 目录经 list_frames,不在 system)', () => {
     const t = buildMcpTools().find((t) => t.name === 'attach_frame')!;
@@ -123,16 +207,20 @@ describe('MCP 协议处理', () => {
     const r = await handleMcpRequest({ id: 2, method: 'resources/list' }, deps());
     expect(r!.error?.code).toBe(-32601);
   });
-  it('服务端内容工具不过桥:read_editing_guide / read_frame / list_frames', async () => {
+  it('服务端内容工具不过桥:read_editing_guide / read_frame / list_frames / Studio Skills', async () => {
     const d = deps();
     await handleMcpRequest({ id: 3, method: 'tools/call', params: { name: 'read_editing_guide' } }, d);
     await handleMcpRequest({ id: 4, method: 'tools/call', params: { name: 'read_frame', arguments: { frame_id: 'f1' } } }, d);
     await handleMcpRequest({ id: 5, method: 'tools/call', params: { name: 'list_frames' } }, d);
+    await handleMcpRequest({ id: 51, method: 'tools/call', params: { name: 'list_skills', arguments: { query: '大女主' } } }, d);
+    await handleMcpRequest({ id: 52, method: 'tools/call', params: { name: 'read_skill', arguments: { skill_id: 'usk_1' } } }, d);
     expect(d.callBridge).not.toHaveBeenCalled();
     expect(d.readEditingGuide).toHaveBeenCalled();
     expect(d.readFrame).toHaveBeenCalledWith('f1');
+    expect(d.listSkills).toHaveBeenCalledWith({ query: '大女主' });
+    expect(d.readSkill).toHaveBeenCalledWith('usk_1');
     // 服务端直答集合与 dispatch 的特判保持同步
-    expect([...MCP_SERVER_TOOL_IDS].sort()).toEqual(['clone_voice', 'create_browser_handoff', 'create_project', 'delete_voice', 'design_voice', 'generate_image', 'generate_music', 'generate_speech', 'generate_video', 'get_generation_jobs', 'get_icons', 'import_media', 'import_stock', 'lip_sync', 'list_assets', 'list_frames', 'list_models', 'list_projects', 'list_voices', 'read_editing_guide', 'read_frame', 'rename_project', 'search_assets', 'search_stock', 'switch_project']);
+    expect([...MCP_SERVER_TOOL_IDS].sort()).toEqual(['clone_voice', 'create_browser_handoff', 'create_project', 'delete_voice', 'design_voice', 'generate_image', 'generate_music', 'generate_sfx', 'generate_speech', 'generate_video', 'get_generation_jobs', 'get_icons', 'import_media', 'import_stock', 'lip_sync', 'list_assets', 'list_frames', 'list_models', 'list_projects', 'list_skills', 'list_voices', 'read_editing_guide', 'read_frame', 'read_skill', 'rename_project', 'search_assets', 'search_stock', 'switch_project']);
     // import_media 服务端直答(登记进项目行,不过桥)
     const d2 = deps();
     await handleMcpRequest({ id: 100, method: 'tools/call', params: { name: 'import_media', arguments: { sig: 'a.mp4:1:2' } } }, d2);
@@ -171,11 +259,13 @@ describe('MCP 协议处理', () => {
     await handleMcpRequest({ id: 109, method: 'tools/call', params: { name: 'generate_image', arguments: { prompt: 'ocean' } } }, d6);
     await handleMcpRequest({ id: 110, method: 'tools/call', params: { name: 'generate_video', arguments: { prompt: 'waves' } } }, d6);
     await handleMcpRequest({ id: 111, method: 'tools/call', params: { name: 'generate_music', arguments: { prompt: 'calm piano' } } }, d6);
+    await handleMcpRequest({ id: 1111, method: 'tools/call', params: { name: 'generate_sfx', arguments: { prompt: 'short whoosh', durationSec: 1.5 } } }, d6);
     await handleMcpRequest({ id: 112, method: 'tools/call', params: { name: 'get_generation_jobs', arguments: { ids: ['ci1'] } } }, d6);
     expect(d6.listModels).toHaveBeenCalledWith({ kind: 'image' });
     expect(d6.generateImage).toHaveBeenCalledWith({ prompt: 'ocean' });
     expect(d6.generateVideo).toHaveBeenCalledWith({ prompt: 'waves' });
     expect(d6.generateMusic).toHaveBeenCalledWith({ prompt: 'calm piano' });
+    expect(d6.generateSfx).toHaveBeenCalledWith({ prompt: 'short whoosh', durationSec: 1.5 });
     expect(d6.getGenerationJobs).toHaveBeenCalledWith({ ids: ['ci1'] });
     expect(d6.callBridge).not.toHaveBeenCalled();
   });
@@ -188,11 +278,14 @@ describe('MCP 协议处理', () => {
     const r = await handleMcpRequest({ id: 8, method: 'tools/call', params: { name: 'nope' } }, d);
     expect(r!.error?.code).toBe(-32602);
   });
-  it('get_state:过桥,快照文本直接作 content 正文(不裹 JSON)', async () => {
+  it('get_state:过桥,快照文本直接作 content 正文(不裹 JSON),并带 skill 基线行(长会话跨发版也能收到更新信号)', async () => {
     const d = deps({ callBridge: vi.fn(async () => ({ ok: true, state: '<composition_state>\nX\n</composition_state>' })) });
     const r = await handleMcpRequest({ id: 9, method: 'tools/call', params: { name: 'get_state' } }, d);
     const content = (r!.result as { content: { text: string }[]; isError: boolean }).content;
     expect(content[0]!.text).toContain('<composition_state>');
+    expect(content[0]!.text).toContain('Pireel workflow baseline:');
+    // Channel-neutral by contract: Plugin bundles must NOT be told to run the standalone CLI.
+    expect(content[0]!.text).not.toContain('npx skills');
     expect((r!.result as { isError: boolean }).isError).toBe(false);
   });
   it('桥失败(studio 没开)→ isError=true,正文带 hint', async () => {

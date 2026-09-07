@@ -26,13 +26,55 @@ import { DEFAULT_CAPTION_WIDTH_PCT } from './composition-core';
 import { BASE_CAPTION_FONT_PX, CAPTION_WEIGHT_BOLD, CAPTION_WEIGHT_REGULAR } from './caption-presets';
 import { latinJoin, wordsFromText } from './caption-fx';
 import { captionFontCss as presetFontCss, captionLineSegments } from './caption-layout-metrics';
+import {
+  displayTextFontCss,
+  displayTextPreset,
+  isDisplayTextAnimationId,
+  isDisplayTextPresetId,
+  type DisplayTextPresetId,
+} from './display-text-presets';
 
 /* ============================ template render impls ============================ */
 
-function renderTitle(slots: Slots, id: string): Rendered {
+function displayTextUnits(text: string): string {
+  const units = /\s/u.test(text) ? text.split(/(\s+)/u) : Array.from(text);
+  return units.map((unit) => /^\s+$/u.test(unit)
+    ? `<span class="t-space">${'&nbsp;'.repeat(Math.max(1, unit.length))}</span>`
+    : `<span class="t-unit">${escapeHtml(unit)}</span>`).join('');
+}
+
+function safeDisplayColor(value: unknown, fallback: string): string {
+  return typeof value === 'string' && /^#[0-9a-f]{3,8}$/iu.test(value.trim()) ? value.trim() : fallback;
+}
+
+function displayTextLook(preset: DisplayTextPresetId): string {
+  switch (preset) {
+    case 'editorial':
+      return 'font-family:Iowan Old Style,Songti SC,STSong,serif;font-weight:650;letter-spacing:-0.02em;font-style:italic;';
+    case 'headline':
+      return 'font-family:var(--font-head);font-weight:950;letter-spacing:-0.055em;text-transform:uppercase;';
+    case 'outline':
+      return 'font-family:var(--font-head);font-weight:950;letter-spacing:-0.045em;color:transparent;-webkit-text-stroke:3px var(--display-fg);text-shadow:0 5px 24px rgba(0,0,0,.42);';
+    case 'marker':
+      return 'font-family:var(--font-head);font-weight:900;letter-spacing:-0.035em;';
+    case 'label':
+      return 'font-family:var(--font-head);font-weight:850;letter-spacing:.035em;text-transform:uppercase;';
+    default:
+      return 'font-family:var(--font-head);font-weight:800;letter-spacing:-0.025em;';
+  }
+}
+
+function renderTitle(slots: Slots, id: string, _startSec = 0, durationSec = 3): Rendered {
   const text = str(slots.text);
   const sub = str(slots.sub);
-  const innerHtml = `
+  const nativeDisplayText = isDisplayTextPresetId(slots.preset)
+    || isDisplayTextAnimationId(slots.animation)
+    || slots.fontSize != null || slots.fontWeight != null || slots.fontFamily != null
+    || slots.color != null || slots.accentColor != null;
+  // Legacy/manual title cards keep their established underline treatment. Agent-created display
+  // text opts into the declarative preset channel below.
+  if (!nativeDisplayText) {
+    const innerHtml = `
 <div class="t-root">
   <h1 data-edit="text">${escapeHtml(text)}</h1>
   ${sub ? `<div class="sub" data-edit="sub">${escapeHtml(sub)}</div>` : ''}
@@ -43,9 +85,59 @@ function renderTitle(slots: Slots, id: string): Rendered {
 #${id} .t-root::after { content:''; width:96px; height:4px; margin-top:32px; background:var(--accent); border-radius:2px; box-shadow:var(--glow); }
 #${id} .sub { color:var(--accent); font-size:42px; font-weight:600; margin-top:24px; letter-spacing:0.04em; }
 </style>`.trim();
-  const timelineBody =
-    `tl.from('#${id} h1', { opacity: 0, y: 60, duration: 0.6, ease: 'power3.out' }, 0);` +
-    (sub ? `\ntl.from('#${id} .sub', { opacity: 0, y: 30, duration: 0.5 }, 0.2);` : '');
+    const timelineBody =
+      `tl.from('#${id} h1', { opacity: 0, y: 60, duration: 0.6, ease: 'power3.out' }, 0);` +
+      (sub ? `\ntl.from('#${id} .sub', { opacity: 0, y: 30, duration: 0.5 }, 0.2);` : '');
+    return { innerHtml, timelineBody };
+  }
+
+  const preset = displayTextPreset(slots.preset);
+  const animation = isDisplayTextAnimationId(slots.animation) ? slots.animation : preset.defaultAnimation;
+  const align = slots.align === 'left' || slots.align === 'right' ? slots.align : 'center';
+  const alignItems = align === 'left' ? 'flex-start' : align === 'right' ? 'flex-end' : 'center';
+  const fontSize = typeof slots.fontSize === 'number' && Number.isFinite(slots.fontSize)
+    ? Math.max(24, Math.min(180, Math.round(slots.fontSize))) : 92;
+  const fontWeight = typeof slots.fontWeight === 'number' && Number.isFinite(slots.fontWeight)
+    ? Math.max(300, Math.min(950, Math.round(slots.fontWeight / 50) * 50)) : undefined;
+  const fg = safeDisplayColor(slots.color, '#FFFFFF');
+  const accent = safeDisplayColor(slots.accentColor, '#FFD24D');
+  const fontFamily = displayTextFontCss(slots.fontFamily);
+  const animationClass = animation === 'highlightPop'
+    ? ' anim-highlight-pop'
+    : animation === 'highlightBlock' ? ' anim-highlight-block' : '';
+  const units = displayTextUnits(text);
+  const innerHtml = `
+<div class="t-root">
+  <h1 class="preset-${preset.id}${animationClass}" data-edit="text">${units}</h1>
+  ${sub ? `<div class="sub" data-edit="sub">${escapeHtml(sub)}</div>` : ''}
+</div>
+<style>
+#${id} .t-root{--display-fg:${fg};--display-accent:${accent};position:absolute;inset:0;display:flex;flex-direction:column;align-items:${alignItems};justify-content:center;overflow:visible;}
+#${id} h1{margin:0;max-width:100%;color:var(--display-fg);font-size:${fontSize}px;${displayTextLook(preset.id)}${fontFamily ? `font-family:${fontFamily};` : ''}${fontWeight ? `font-weight:${fontWeight};` : ''}line-height:1.04;text-align:${align};text-wrap:balance;text-shadow:0 3px 24px rgba(0,0,0,.48);}
+#${id} .t-unit,#${id} .t-space{display:inline-block;white-space:pre;}
+#${id} .preset-editorial::after{content:'';display:block;width:1.35em;height:3px;margin:.22em ${align === 'center' ? 'auto' : '0'} 0;background:var(--display-accent);box-shadow:var(--glow);}
+#${id} .preset-marker .t-unit{padding:.03em .09em;margin:0 .015em;background:linear-gradient(transparent 18%,var(--display-accent) 18%,var(--display-accent) 88%,transparent 88%);color:var(--display-fg);text-shadow:none;}
+#${id} .preset-label{display:inline-block;width:auto;padding:.14em .3em;background:var(--display-accent);color:var(--display-fg);box-shadow:8px 8px 0 rgba(0,0,0,.34);text-shadow:none;}
+#${id} .anim-highlight-pop .t-unit{padding:.03em .08em;margin:0 .012em;background:var(--display-accent);color:var(--display-fg);text-shadow:none;}
+#${id} .anim-highlight-block{display:inline-block;width:auto;padding:.12em .28em;background:var(--display-accent);color:var(--display-fg);text-shadow:none;}
+#${id} .sub{color:var(--display-accent);font-family:var(--font-body);font-size:${Math.max(24, Math.round(fontSize * .42))}px;font-weight:650;margin-top:.5em;letter-spacing:.04em;text-align:${align};}
+</style>`.trim();
+  const selector = `#${id} h1`;
+  const unitSelector = `#${id} .t-unit`;
+  const entrance = Math.min(.65, Math.max(.25, durationSec * .18));
+  const stagger = Math.min(.12, Math.max(.025, durationSec * .55 / Math.max(1, Array.from(text).length)));
+  const timelineByAnimation: Record<string, string> = {
+    none: '',
+    popIn: `tl.from('${selector}',{autoAlpha:0,scale:.76,duration:${n(entrance)},ease:'back.out(1.7)'},0);`,
+    slideUp: `tl.from('${selector}',{autoAlpha:0,y:48,duration:${n(entrance)},ease:'power3.out'},0);`,
+    typewriter: `tl.from('${unitSelector}',{autoAlpha:0,duration:.01,stagger:${n(stagger)},ease:'none'},0);`,
+    wordReveal: `tl.from('${unitSelector}',{autoAlpha:0,y:24,duration:.28,stagger:${n(stagger)},ease:'power2.out'},0);`,
+    wordSlide: `tl.from('${unitSelector}',{autoAlpha:0,x:-28,rotate:-3,duration:.32,stagger:${n(stagger)},ease:'power3.out'},0);`,
+    highlightPop: `tl.from('${unitSelector}',{autoAlpha:0,scale:.82,duration:.22,stagger:${n(stagger)},ease:'back.out(1.6)'},0);`,
+    highlightBlock: `tl.from('${selector}',{autoAlpha:0,scaleX:.18,transformOrigin:'left center',duration:${n(entrance)},ease:'power3.out'},0);`,
+  };
+  const timelineBody = timelineByAnimation[animation]
+    + (sub ? `\ntl.from('#${id} .sub',{autoAlpha:0,y:18,duration:.35},.18);` : '');
   return { innerHtml, timelineBody };
 }
 
@@ -117,12 +209,14 @@ function renderCaption(slots: Slots, id: string): Rendered {
     ...(typeof slots.color === 'string' ? { color: slots.color as string } : {}),
     ...(slots.bg === null || typeof slots.bg === 'string' ? { bg: slots.bg as string | null } : {}),
     ...(typeof slots.bold === 'boolean' ? { bold: slots.bold as boolean } : {}),
+    ...(typeof slots.font === 'string' ? { font: slots.font as string } : {}),
   };
   const subOv = {
     ...(typeof slots.subPreset === 'string' ? { preset: slots.subPreset as string } : {}),
     ...(typeof slots.subColor === 'string' ? { color: slots.subColor as string } : {}),
     ...(slots.subBg === null || typeof slots.subBg === 'string' ? { bg: slots.subBg as string | null } : {}),
     ...(typeof slots.subBold === 'boolean' ? { bold: slots.subBold as boolean } : {}),
+    ...(typeof slots.subFont === 'string' ? { font: slots.subFont as string } : {}),
   };
   return renderPresetCaption(words, getCaptionPreset(str(slots.preset) || undefined), yPct, xPct, wPct, scale, id, hPct, str(slots.sub) || undefined, subStyle, canvasW, ov, subOv, slots.cue === true);
 }
@@ -150,7 +244,7 @@ function renderCaption(slots: Slots, id: string): Rendered {
  *     env has no canvas → deterministic glyph-class estimate table fallback.
  */
 
-function renderPresetCaption(words: FxWord[], p: CaptionPreset, yPct: number, xPct: number, wPct: number, scale: number, id: string, hPct = 0, sub?: string, subStyle?: { yPct?: number; xPct?: number; wPct?: number; scale?: number; hPct?: number }, canvasW = 1080, ov: { color?: string; bg?: string | null; bold?: boolean } = {}, subOv: { preset?: string; color?: string; bg?: string | null; bold?: boolean } = {}, cue = false): Rendered {
+function renderPresetCaption(words: FxWord[], p: CaptionPreset, yPct: number, xPct: number, wPct: number, scale: number, id: string, hPct = 0, sub?: string, subStyle?: { yPct?: number; xPct?: number; wPct?: number; scale?: number; hPct?: number }, canvasW = 1080, ov: { color?: string; bg?: string | null; bold?: boolean; font?: string } = {}, subOv: { preset?: string; color?: string; bg?: string | null; bold?: boolean; font?: string } = {}, cue = false): Rendered {
   // Effective preset = preset + user overrides (text color / plate). Reassigning p keeps every existing
   // use (segmentation budget, pill, css, karaoke revert color) consistent with the overridden look.
   if (ov.color != null || ov.bg !== undefined) p = { ...p, ...(ov.color != null ? { text: ov.color } : {}), ...(ov.bg !== undefined ? { bg: ov.bg ?? undefined } : {}) };
@@ -165,7 +259,7 @@ function renderPresetCaption(words: FxWord[], p: CaptionPreset, yPct: number, xP
   // difference is presentation: derived cue blocks STACK their lines (all visible, one plate per
   // line — standard subtitle look; at scale 1 a cue fits one line so the stack is a single line);
   // legacy sentence blocks keep the old one-line-at-a-time rotation.
-  const segs = captionLineSegments(words, p, wPct, scale, canvasW, { bold: ov.bold });
+  const segs = captionLineSegments(words, p, wPct, scale, canvasW, { bold: ov.bold, font: ov.font });
   let wIdx = 0;
   const segHtml = segs
     .map((g, si) => {
@@ -194,7 +288,7 @@ function renderPresetCaption(words: FxWord[], p: CaptionPreset, yPct: number, xP
   const subScale = subStyle?.scale ?? scale * 0.7;
   const subFs = Math.max(9, Math.round(BASE_CAPTION_FONT_PX * subScale));
   const subW = subStyle?.wPct ?? wPct;
-  const subSegs = sub ? captionLineSegments(wordsFromText(sub, 0, 1), subP, subW, subScale, canvasW) : [];
+  const subSegs = sub ? captionLineSegments(wordsFromText(sub, 0, 1), subP, subW, subScale, canvasW, { font: subOv.font }) : [];
   const subPill = subP.bg ? `background:${subP.bg}; padding:${Math.round(subFs * 0.18)}px ${Math.round(subFs * 0.5)}px; border-radius:${Math.round(subFs * 0.28)}px;` : '';
   const subHtml = sub
     ? `<div class="cap-sub" id="${id}-sub">${subSegs.map((g) => `<div class="cap-sub-line">${g.map((w, k) => `<span${k < g.length - 1 && latinJoin(w.text, g[k + 1]!.text) ? ' class="sp"' : ''}>${escapeHtml(w.text)}</span>`).join('')}</div>`).join('')}</div>`
@@ -209,7 +303,7 @@ function renderPresetCaption(words: FxWord[], p: CaptionPreset, yPct: number, xP
     : '';
   const subCss = sub
     ? `\n#${id} .cap-sub { position:absolute; pointer-events:auto; left:${n(subStyle?.xPct ?? xPct)}%; ${subAnchor} transform:translateX(-50%); width:auto; max-width:${n(subW)}%; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:${Math.round(subFs * 0.15)}px; ${subStyle?.hPct ? `min-height:${n(subStyle.hPct)}%; ` : ''}${subPill} }
-#${id} .cap-sub-line span.sp { margin-right:${Math.round(subFs * 0.3)}px; }\n#${id} .cap-sub-line span { position:relative; top:-0.04em; flex:none; white-space:nowrap; }\n#${id} .cap-sub-line { display:flex; flex-wrap:nowrap; justify-content:center; align-items:center; max-width:100%; text-align:center; color:${subP.text}; font-family:${presetFontCss(subP)}; font-size:${subFs}px; font-weight:${subOv.bold ? 700 : CAPTION_WEIGHT_REGULAR}; line-height:1.35; ${subP.italic ? 'font-style:italic; ' : ''}${!subP.bg ? 'text-shadow:0 2px 12px rgba(0,0,0,0.85),0 0 3px rgba(0,0,0,0.8); ' : ''} }`
+#${id} .cap-sub-line span.sp { margin-right:${Math.round(subFs * 0.3)}px; }\n#${id} .cap-sub-line span { position:relative; top:-0.04em; flex:none; white-space:nowrap; }\n#${id} .cap-sub-line { display:flex; flex-wrap:nowrap; justify-content:center; align-items:center; max-width:100%; text-align:center; color:${subP.text}; font-family:${presetFontCss(subP, subOv.font)}; font-size:${subFs}px; font-weight:${subOv.bold ? 700 : CAPTION_WEIGHT_REGULAR}; line-height:1.35; ${subP.italic ? 'font-style:italic; ' : ''}${!subP.bg ? 'text-shadow:0 2px 12px rgba(0,0,0,0.85),0 0 3px rgba(0,0,0,0.8); ' : ''} }`
     : '';
   const decoCss =
     p.deco === 'highlight'
@@ -225,7 +319,7 @@ function renderPresetCaption(words: FxWord[], p: CaptionPreset, yPct: number, xP
 #${id} .cap-root { position:absolute; inset:0; }
 ${stackCss}
 #${id} .cap-line { ${cue ? 'position:relative; max-width:100%;' : `position:absolute; left:${n(xPct)}%; bottom:${n(100 - yPct)}%; transform:translateX(-50%); transform-origin:center bottom; width:${n(wPct)}%; ${hPct > 0 ? `min-height:${n(hPct)}%; ` : ''}`}display:flex; flex-wrap:nowrap; align-items:center; justify-content:center; pointer-events:auto; ${cue ? '' : pill} }
-#${id} .w { position:relative; top:-0.04em; flex:none; white-space:nowrap; color:${p.text}; font-family:${presetFontCss(p)}; font-size:${fs}px; font-weight:${mainWeight}; ${p.italic ? 'font-style:italic;' : ''} line-height:1.2; ${!p.bg ? 'text-shadow:0 2px 12px rgba(0,0,0,0.85),0 0 3px rgba(0,0,0,0.8);' : ''} }
+#${id} .w { position:relative; top:-0.04em; flex:none; white-space:nowrap; color:${p.text}; font-family:${presetFontCss(p, ov.font)}; font-size:${fs}px; font-weight:${mainWeight}; ${p.italic ? 'font-style:italic;' : ''} line-height:1.2; ${!p.bg ? 'text-shadow:0 2px 12px rgba(0,0,0,0.85),0 0 3px rgba(0,0,0,0.8);' : ''} }
 ${decoCss}
 #${id} .w .t { position:relative; z-index:1; }\n#${id} .w.sp { margin-right:${Math.round(fs * 0.3)}px; }${subCss}`.trim();
 
@@ -397,7 +491,17 @@ export function ensureTemplatesRegistered(): void {
     name: 'common.titleCard',
     kind: 'title',
     defaultTrackIndex: 2,
-    slots: { text: { type: 'text', label: 'common.title', required: true }, sub: { type: 'text', label: 'engine.subtitle' } },
+    slots: {
+      text: { type: 'text', label: 'common.title', required: true },
+      sub: { type: 'text', label: 'engine.subtitle' },
+      preset: { type: 'enum', label: 'engine.displayTextPreset', options: ['clean', 'editorial', 'headline', 'outline', 'marker', 'label'] },
+      animation: { type: 'enum', label: 'engine.animation', options: ['none', 'popIn', 'slideUp', 'typewriter', 'wordReveal', 'wordSlide', 'highlightPop', 'highlightBlock'] },
+      color: { type: 'text', label: 'engine.textColor' },
+      accentColor: { type: 'text', label: 'engine.accentColor' },
+      fontSize: { type: 'json', label: 'engine.fontSize' },
+      fontWeight: { type: 'json', label: 'engine.fontWeight' },
+      align: { type: 'enum', label: 'engine.alignment', options: ['left', 'center', 'right'] },
+    },
     render: renderTitle,
   });
   registerTemplate({

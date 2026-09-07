@@ -10,7 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { X } from "lucide-react";
+import { ChevronRight, Info, X } from "lucide-react";
 import { useChat } from "@ai-sdk/react";
 import {
   DefaultChatTransport,
@@ -37,8 +37,16 @@ import {
   type StudioScenarioSkillId,
 } from "@pireel/studio-engine/scenario-skills";
 import { studioProviders } from "@pireel/studio-engine/providers";
+import {
+  STUDIO_CREATE_SKILL_ACTION,
+  latestStudioMetaAction,
+} from "@pireel/studio-engine/skill-actions";
+import { v3ToolCanMutate, V3_TOOL_IDS } from "@pireel/studio-engine/agent-surface-v3/registry";
 import type { FrameCatalogItem } from "./use-frame-catalog";
 import {
+  CHAT_ACTION_PILL_CLASS,
+  CHAT_PILL_ICON_CLASS,
+  CHAT_PILL_LABEL_CLASS,
   mid,
   PiAvatar,
   ThinkingDots,
@@ -52,14 +60,27 @@ import {
 } from "./chat-tool-parts";
 import { Composer, type ComposerHandle } from "./chat-composer";
 import {
+  assistantEditorialCapacityShortfall,
   assistantHasOpenOrInterruptedInteraction,
   assistantMessageHasRenderableOutput,
+  assistantMessageSuggestsContinuation,
+  assistantWorkDurationMs,
+  assistantWorkFold,
+  compactStudioChatMessages,
+  compactStudioChatMessagesForModel,
+  createStudioTurnLedger,
   isRecoverableStudioChatError,
+  recordStudioTurnToolResult,
+  shouldBlockStudioTurnUndo,
+  stampLatestAssistantWorkDuration,
 } from "./chat-thread-store";
 import { scopeSituationToThread } from "./chat-thread-context";
-import { t } from "./i18n";
+import { studioLocale, t } from "./i18n";
 import type { StudioScenarioSkillOption } from "./shell-context";
 import { localAssetMentionContext } from "./chat-local-asset-mention";
+import { inspectTimelineFrameEvidence } from "./chat-timeline-frame-evidence";
+import { DeferredActivation } from "./deferred-activation";
+import { studioToolCanMutate, studioToolResultStopsAgentTurn } from "./agent-tool-runner";
 import type {
   AttachedFrame,
   ProgressHandle,
@@ -70,12 +91,14 @@ import type {
 } from "./studio-chat";
 
 export function ChatThread({
+  projectId,
   threadId,
   initialMessages,
   initialFrame,
   initialSkillId,
   scenarioSkills,
-  onImportScenarioSkill,
+  onOpenSkillMarket,
+  onRefreshScenarioSkills,
   onDeleteScenarioSkill,
   frames,
   onFrameApplied,
@@ -88,14 +111,17 @@ export function ChatThread({
   onTimelineFramePickActiveChange,
   elements,
   onSnapshot,
+  onBusyChange,
   handleRef,
 }: {
+  projectId?: string;
   threadId: string;
   initialMessages: UIMessage[];
   initialFrame: AttachedFrame | null;
   initialSkillId: StudioScenarioSkillId;
   scenarioSkills: readonly StudioScenarioSkillOption[];
-  onImportScenarioSkill?: (file: File) => Promise<StudioScenarioSkillOption>;
+  onOpenSkillMarket?: () => void;
+  onRefreshScenarioSkills?: () => Promise<void>;
   onDeleteScenarioSkill?: (id: string) => Promise<void>;
   frames: FrameCatalogItem[];
   onFrameApplied?: (frame: AttachedFrame | null) => void;
@@ -112,6 +138,7 @@ export function ChatThread({
     frame: AttachedFrame | null,
     skillId: StudioScenarioSkillId,
   ) => void;
+  onBusyChange?: (busy: boolean) => void;
   handleRef: React.MutableRefObject<StudioChatHandle | null>;
 }) {
   const runToolRef = useRef(runTool);
@@ -121,9 +148,25 @@ export function ChatThread({
   // safety net from resurrecting a turn the user just killed.
   const toolAbortRef = useRef<AbortController | null>(null);
   const userStoppedRef = useRef(false);
+  const interactionWaitDurationRef = useRef(0);
   const autoRecoveryAttemptedRef = useRef(false);
+  const turnLedgerRef = useRef(createStudioTurnLedger());
+  const timelineFrameInspectionRef = useRef<AbortController | null>(null);
+  const [timelineFrameInspectionError, setTimelineFrameInspectionError] = useState(false);
+  // Completed work stays visible by default. The arrow is an explicit user collapse, not an
+  // automatic replacement of the whole turn with an empty-looking summary row.
+  const [collapsedWorkMessages, setCollapsedWorkMessages] = useState<Set<string>>(() => new Set());
+  useEffect(() => () => timelineFrameInspectionRef.current?.abort(), []);
   const getBodyRef = useRef(getBody);
   getBodyRef.current = getBody;
+  // Which tool surface the chat route speaks. v3 names collide with legacy names (add_clips, get_state, …)
+  // under different contracts, so the client must know before it routes a tool call. Resolved once.
+  const agentSurfaceRef = useRef<"legacy" | "v3">("legacy");
+  useEffect(() => {
+    let cancelled = false;
+    void studioProviders().agentSurface?.().then((surface) => { if (!cancelled) agentSurfaceRef.current = surface; });
+    return () => { cancelled = true; };
+  }, []);
   const composerRef = useRef<ComposerHandle | null>(null);
 
   // Frame attached to the session: input theme button highlights, every request carries frameId along (server injects the playbook)
@@ -136,11 +179,6 @@ export function ChatThread({
   skillRef.current = skillId;
   const onFrameAppliedRef = useRef(onFrameApplied);
   onFrameAppliedRef.current = onFrameApplied;
-  /** Attach a frame (shared by panel/theme button): besides session state, also notifies the workbench to apply the theme palette to comp. */
-  const applyFrame = useCallback((f: AttachedFrame | null) => {
-    setFrame(f);
-    onFrameAppliedRef.current?.(f);
-  }, []);
 
   // body carries session-level frameId + skillId; the situation snapshot is attached to metadata.situation at send time (persists with the session,
   // the route materializes it into a <composition_state> part) — stable history bytes are what let the prompt cache hit
@@ -149,6 +187,8 @@ export function ChatThread({
       new DefaultChatTransport({
         api: studioProviders().chatEndpoint ?? "/api/studio/chat",
         body: () => ({
+          locale: studioLocale().toLowerCase().startsWith("zh") ? "zh" : "en",
+          ...(projectId ? { projectId } : {}),
           ...(frameRef.current ? { frameId: frameRef.current.id } : {}),
           ...(frameRef.current?.customVisualStyle
             ? { customVisualStyle: frameRef.current.customVisualStyle }
@@ -157,9 +197,26 @@ export function ChatThread({
             ? { skillId: skillRef.current }
             : {}),
         }),
+        prepareSendMessagesRequest: ({
+          body,
+          id,
+          messageId,
+          messages: requestMessages,
+          trigger,
+        }) => ({
+          body: {
+            ...body,
+            id,
+            messageId,
+            messages: compactStudioChatMessagesForModel(requestMessages),
+            trigger,
+          },
+        }),
       }),
     [],
   );
+
+  const messagesRef = useRef<UIMessage[]>(initialMessages);
 
   const {
     messages,
@@ -182,42 +239,94 @@ export function ChatThread({
       lastAssistantMessageIsCompleteWithToolCalls(args),
     async onToolCall({ toolCall }) {
       const id = toolCall.toolName;
-      // Fresh controller per tool run: the stop button aborts it so long tools can stand down at
-      // their safe boundaries instead of holding the turn hostage until they finish
-      const ctrl = new AbortController();
-      toolAbortRef.current = ctrl;
-      try {
-        const out = await runToolRef.current(
-          id,
-          (toolCall.input ?? {}) as Record<string, unknown>,
-          { signal: ctrl.signal, surface: "chat" },
-        );
-        if (out.ok)
-          addToolOutput({
-            tool: id,
-            toolCallId: toolCall.toolCallId,
-            output: out,
-          });
-        else
-          addToolOutput({
-            tool: id,
-            toolCallId: toolCall.toolCallId,
-            state: "output-error",
-            errorText: out.error ?? t("chatGen.executionFailed"),
-          });
-      } catch (e) {
-        const isStop = e instanceof DOMException && e.name === "AbortError";
+      const requestedInput = (toolCall.input ?? {}) as Record<string, unknown>;
+      const ledger = turnLedgerRef.current;
+      const v3 = agentSurfaceRef.current === "v3" && V3_TOOL_IDS.has(id);
+      const canMutate = v3 ? v3ToolCanMutate(id) : studioToolCanMutate(id);
+      const publishSuccess = (output: Record<string, unknown>) => {
+        const recorded = recordStudioTurnToolResult(ledger, {
+          toolId: id,
+          toolCallId: toolCall.toolCallId,
+          input: requestedInput,
+          output,
+          canMutate,
+        });
+        addToolOutput({ tool: id, toolCallId: toolCall.toolCallId, output });
+        return recorded;
+      };
+      const publishError = (errorText: string) => {
+        const recorded = recordStudioTurnToolResult(ledger, {
+          toolId: id,
+          toolCallId: toolCall.toolCallId,
+          input: requestedInput,
+          errorText,
+          canMutate,
+        });
+        // A verbatim retry of a failed call fails identically forever; say so on the receipt the
+        // moment the repetition starts instead of letting the streak burn the turn budget.
+        if (recorded.repeatedFailureCount >= 2) {
+          errorText += studioLocale().toLowerCase().startsWith("zh")
+            ? `（完全相同的调用已连续失败 ${recorded.repeatedFailureCount} 次，重试不会成功：改用回执里的真实 id 与参数，或放弃该操作直接收尾。）`
+            : ` (This identical call has now failed ${recorded.repeatedFailureCount} times in a row; retrying cannot succeed. Use the real ids and parameters from receipts, or drop this operation and finish.)`;
+        } else if (recorded.sameToolFailureCount >= 2) {
+          // Reworded retries of one tool are the same loop with different text on it.
+          errorText += studioLocale().toLowerCase().startsWith("zh")
+            ? `（${id} 已连续失败 ${recorded.sameToolFailureCount} 次，换措辞重试无效：按错误提示改参数形状；改不了就别再调用它，直接用文字回复用户。）`
+            : ` (${id} has now failed ${recorded.sameToolFailureCount} times in a row; rewording it does not help. Fix the input shape the error describes, or stop calling this tool and answer the user in plain text.)`;
+        }
         addToolOutput({
           tool: id,
           toolCallId: toolCall.toolCallId,
           state: "output-error",
-          errorText: isStop
+          errorText,
+        });
+      };
+      if (id === "undo" && shouldBlockStudioTurnUndo(ledger)) {
+        publishSuccess({
+          ok: true,
+          skipped: true,
+          summary: studioLocale().toLowerCase().startsWith("zh")
+            ? "上一项失败且未改动时间线，已跳过撤销"
+            : "The previous operation failed without changing the timeline, so undo was skipped.",
+          data: { skipped: true, reason: "previous-mutation-failed", didMutate: false },
+        });
+        return;
+      }
+      // Fresh controller per tool run: the stop button aborts it so long tools can stand down at
+      // their safe boundaries instead of holding the turn hostage until they finish
+      const ctrl = new AbortController();
+      toolAbortRef.current = ctrl;
+      const interactionWaitStartedAt = id === "ask_user" || id === "request_approval"
+        ? Date.now()
+        : null;
+      try {
+        const runOpts = {
+          signal: ctrl.signal,
+          surface: "chat" as const,
+          ...(skillRef.current !== STUDIO_AUTO_SKILL_ID ? { skillId: skillRef.current } : {}),
+        };
+        // v3 names execute through the v3 adapter (frames in, one undo step, delta out); legacy names run as before.
+        const out = v3
+          ? await runToolRef.current("run_v3", { name: id, args: requestedInput }, runOpts)
+          : await runToolRef.current(id, requestedInput, runOpts);
+        const stopAfterReceipt = studioToolResultStopsAgentTurn(out);
+        if (stopAfterReceipt) userStoppedRef.current = true;
+        if (out.ok) publishSuccess(out as unknown as Record<string, unknown>);
+        else publishError(out.error ?? t("chatGen.executionFailed"));
+        if (stopAfterReceipt) void stop();
+      } catch (e) {
+        const isStop = e instanceof DOMException && e.name === "AbortError";
+        publishError(
+          isStop
             ? e.message || t("chatGen.stopped")
             : e instanceof Error
               ? e.message
               : String(e),
-        });
+        );
       } finally {
+        if (interactionWaitStartedAt !== null) {
+          interactionWaitDurationRef.current += Math.max(0, Date.now() - interactionWaitStartedAt);
+        }
         if (toolAbortRef.current === ctrl) toolAbortRef.current = null;
       }
     },
@@ -227,19 +336,104 @@ export function ChatThread({
   // so switching sessions / refreshing mid-generation doesn't evaporate the streamed-out parts and completed tool outputs.
   // On first mount status is already 'ready' (also when restoring/switching to an old session) — skip that one,
   // otherwise merely opening an old session refreshes its updatedAt and scrambles the history ordering.
-  const messagesRef = useRef(messages);
   messagesRef.current = messages;
-  const mountedRef = useRef(false);
+  const persistSessionState = useCallback(
+    (nextFrame: AttachedFrame | null, nextSkillId: StudioScenarioSkillId) => {
+      if (messagesRef.current.length > 0)
+        onSnapshot(compactStudioChatMessages(messagesRef.current), nextFrame, nextSkillId);
+    },
+    [onSnapshot],
+  );
+  /** Attach a frame (shared by panel/theme button): update the request state, apply the palette, and persist this explicit user action. */
+  const applyFrame = useCallback(
+    (nextFrame: AttachedFrame | null) => {
+      frameRef.current = nextFrame;
+      setFrame(nextFrame);
+      onFrameAppliedRef.current?.(nextFrame);
+      persistSessionState(nextFrame, skillRef.current);
+    },
+    [persistSessionState],
+  );
+  const applySkill = useCallback(
+    (nextSkillId: StudioScenarioSkillId) => {
+      if (skillRef.current === nextSkillId) return;
+      skillRef.current = nextSkillId;
+      setSkillId(nextSkillId);
+      persistSessionState(frameRef.current, nextSkillId);
+    },
+    [persistSessionState],
+  );
+  const statusSnapshotActivationRef = useRef<DeferredActivation | null>(null);
+  if (!statusSnapshotActivationRef.current)
+    statusSnapshotActivationRef.current = new DeferredActivation();
   useEffect(() => {
-    if (!mountedRef.current) {
-      mountedRef.current = true;
-      return;
-    }
+    if (!statusSnapshotActivationRef.current!.active)
+      return statusSnapshotActivationRef.current!.defer();
     if (status === "ready" || status === "error")
-      onSnapshot(messagesRef.current, frameRef.current, skillRef.current);
+      onSnapshot(compactStudioChatMessages(messagesRef.current), frameRef.current, skillRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status]);
   const busy = status === "streaming" || status === "submitted";
+  // The workbench pauses output switching while a turn runs: a mid-run switch retargets every
+  // later tool call (a real run dropped one output's picture-in-picture into another).
+  const onBusyChangeRef = useRef(onBusyChange);
+  onBusyChangeRef.current = onBusyChange;
+  useEffect(() => {
+    onBusyChangeRef.current?.(busy);
+    return () => onBusyChangeRef.current?.(false);
+  }, [busy]);
+
+  const workTimingActivationRef = useRef<DeferredActivation | null>(null);
+  if (!workTimingActivationRef.current)
+    workTimingActivationRef.current = new DeferredActivation();
+  useEffect(() => {
+    if (!workTimingActivationRef.current!.active)
+      return workTimingActivationRef.current!.defer();
+    if (status !== "ready" && status !== "error") return;
+    const timedMessages = stampLatestAssistantWorkDuration(
+      messagesRef.current,
+      Date.now(),
+      interactionWaitDurationRef.current,
+    );
+    if (timedMessages === messagesRef.current) return;
+    messagesRef.current = timedMessages;
+    setMessages(timedMessages);
+    onSnapshot(compactStudioChatMessages(timedMessages), frameRef.current, skillRef.current);
+  }, [onSnapshot, setMessages, status]);
+
+  const refreshedCreatedSkillRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (status !== "ready" || !onRefreshScenarioSkills) return;
+    let createdSkillId: string | null = null;
+    for (let messageIndex = messages.length - 1; messageIndex >= 0 && !createdSkillId; messageIndex -= 1) {
+      const message = messages[messageIndex]!;
+      for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
+        const part = message.parts[partIndex] as {
+          type?: string;
+          toolName?: string;
+          state?: string;
+          output?: unknown;
+        };
+        const toolId = part.type === "dynamic-tool"
+          ? part.toolName
+          : part.type?.startsWith("tool-")
+            ? part.type.slice(5)
+            : undefined;
+        if (toolId !== "save_user_skill" || part.state !== "output-available") continue;
+        const output = part.output as { ok?: unknown; skill_id?: unknown } | undefined;
+        if (output?.ok === true && typeof output.skill_id === "string") {
+          createdSkillId = output.skill_id;
+          break;
+        }
+      }
+    }
+    if (!createdSkillId || refreshedCreatedSkillRef.current === createdSkillId) return;
+    refreshedCreatedSkillRef.current = createdSkillId;
+    composerRef.current?.clearStudioAction();
+    void onRefreshScenarioSkills().catch((error) => {
+      console.error("[studio] custom Skill refresh failed", error);
+    });
+  }, [messages, onRefreshScenarioSkills, status]);
   // Safety net for a dropped continuation: the SDK is supposed to fire the follow-up request from
   // inside addToolOutput (sendAutomaticallyWhen), but that trigger can be missed — observed in the
   // wild: tool output landed, status idle, and no request ever went out, so the turn died on the
@@ -248,16 +442,19 @@ export function ChatThread({
   // completion state (keyed by message id + part count), after a grace delay re-checking status so
   // the SDK's own trigger always wins (no double request), and never on first mount (opening an old
   // session that happens to end on a tool card must not start a paid request by itself; dedicated
-  // ref — mountedRef above is already true by the time this later-defined effect first runs).
+  // ref — the snapshot activation above is intentionally independent from continuation recovery).
   const statusRef = useRef(status);
   statusRef.current = status;
   const autoResumedRef = useRef("");
-  const resumeArmedRef = useRef(false);
+  const resumeActivationRef = useRef<DeferredActivation | null>(null);
+  if (!resumeActivationRef.current)
+    resumeActivationRef.current = new DeferredActivation();
   useEffect(() => {
-    if (!resumeArmedRef.current) {
-      resumeArmedRef.current = true;
-      return;
-    }
+    // Restoring and sanitizing a persisted thread may replace the initial message array after the
+    // first effect setup. Keep that entire startup cycle inert; only message changes that happen
+    // after the final mount settles are eligible for live tool continuation.
+    if (!resumeActivationRef.current!.active)
+      return resumeActivationRef.current!.defer();
     if (status !== "ready") return;
     const timer = setTimeout(() => {
       if (statusRef.current !== "ready") return; // the SDK sent its own follow-up meanwhile
@@ -265,10 +462,9 @@ export function ChatThread({
       const msgs = messagesRef.current;
       const last = msgs[msgs.length - 1];
       if (!last || last.role !== "assistant") return;
-      if (!lastAssistantMessageIsCompleteWithToolCalls({ messages: msgs }))
-        return;
       const key = `${last.id}:${last.parts.length}`;
-      if (autoResumedRef.current === key) return;
+      const completedToolNeedsFollowup = lastAssistantMessageIsCompleteWithToolCalls({ messages: msgs });
+      if (!completedToolNeedsFollowup || autoResumedRef.current === key) return;
       autoResumedRef.current = key;
       void sendMessage();
     }, 300);
@@ -278,7 +474,7 @@ export function ChatThread({
   useEffect(() => {
     if (!busy) return;
     const t = setInterval(
-      () => onSnapshot(messagesRef.current, frameRef.current, skillRef.current),
+      () => onSnapshot(compactStudioChatMessages(messagesRef.current), frameRef.current, skillRef.current),
       2000,
     );
     return () => clearInterval(t);
@@ -304,7 +500,7 @@ export function ChatThread({
       } catch {
         /* already ended */
       }
-      onSnapshot(messagesRef.current, frameRef.current, skillRef.current);
+      onSnapshot(compactStudioChatMessages(messagesRef.current), frameRef.current, skillRef.current);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [],
@@ -317,25 +513,14 @@ export function ChatThread({
     return () => window.removeEventListener("beforeunload", warn);
   }, [busy]);
 
-  // Attaching/detaching a frame also persists (only if there are messages; an empty session shouldn't enter history)
-  useEffect(() => {
-    if (messagesRef.current.length > 0)
-      onSnapshot(messagesRef.current, frame, skillRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frame]);
-
-  // Skill is session state like the attached frame: changing it affects future turns and survives history switching.
-  useEffect(() => {
-    if (messagesRef.current.length > 0)
-      onSnapshot(messagesRef.current, frameRef.current, skillId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [skillId]);
-
   const run = useCallback(
-    (
+    async (
       draft: string | StudioChatDraftPart[],
-      options: { preserveAutoRecoveryAttempt?: boolean } = {},
-    ) => {
+      options: {
+        preserveAutoRecoveryAttempt?: boolean;
+        studioAction?: typeof STUDIO_CREATE_SKILL_ACTION;
+      } = {},
+    ): Promise<boolean> => {
       const draftParts: StudioChatDraftPart[] =
         typeof draft === "string"
           ? [{ type: "text", text: draft.trim() }]
@@ -344,25 +529,37 @@ export function ChatThread({
         (part) => part.type === "timeline-frame" || part.text.trim().length > 0,
       );
       if (!hasContent || status === "streaming" || status === "submitted")
-        return;
+        return false;
       if (!options.preserveAutoRecoveryAttempt)
         autoRecoveryAttemptedRef.current = false;
       userStoppedRef.current = false; // a new message re-arms the continuation safety net
+      interactionWaitDurationRef.current = 0;
+      turnLedgerRef.current = createStudioTurnLedger();
       // Snapshot the current situation at send time: only the latest one represents reality (situations in old messages are history, identity accounts for it)
-      const timelineFrames = draftParts
+      const attachedTimelineFrames = draftParts
         .filter(
           (
             part,
           ): part is Extract<StudioChatDraftPart, { type: "timeline-frame" }> =>
             part.type === "timeline-frame",
         )
-        .map(({ frame }) => ({
-          id: frame.id,
-          atSec: frame.atSec,
-          fps: frame.fps,
-          width: frame.width,
-          height: frame.height,
-        }));
+        .map(({ frame }) => frame);
+      let timelineFrames: Awaited<ReturnType<typeof inspectTimelineFrameEvidence>> = [];
+      if (attachedTimelineFrames.length) {
+        const ctrl = new AbortController();
+        timelineFrameInspectionRef.current = ctrl;
+        setTimelineFrameInspectionError(false);
+        try {
+          timelineFrames = await inspectTimelineFrameEvidence(attachedTimelineFrames, { signal: ctrl.signal, ...(projectId ? { projectId } : {}) });
+        } catch (error) {
+          if (!(error instanceof DOMException && error.name === "AbortError")) {
+            setTimelineFrameInspectionError(true);
+          }
+          return false;
+        } finally {
+          if (timelineFrameInspectionRef.current === ctrl) timelineFrameInspectionRef.current = null;
+        }
+      }
       const localAssetContext = localAssetMentionContext(
         draftParts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
         elements,
@@ -372,18 +569,35 @@ export function ChatThread({
         getBodyRef.current() as ChatSituation,
         previousMessages,
       );
-      const metadata = {
-        situation: [
-          buildSituation(situation, {
-            freshConversation: !previousMessages.some(
-              (message) => message.role === "user",
-            ),
-          }),
+      // v3: no snapshot rides along (the agent pulls get_state); only a frozen hint naming what the user @mentioned,
+      // so the cached prompt prefix stays byte-stable across turns.
+      const mentionedIds = [...new Set(
+        draftParts.flatMap((part) => (part.type === "text" ? [...part.text.matchAll(/@([A-Za-z0-9_:./-]+)/g)].map((m) => m[1]!) : [])),
+      )];
+      const mentionHint = agentSurfaceRef.current === "v3"
+        ? [
+          mentionedIds.length ? `Referenced elements in this message (use these ids directly): ${JSON.stringify(mentionedIds)}` : "",
           localAssetContext,
-        ]
-          .filter(Boolean)
-          .join("\n"),
+        ].filter(Boolean).join("\n")
+        : "";
+      const metadata = {
+        workStartedAt: Date.now(),
+        ...(agentSurfaceRef.current === "v3"
+          ? (mentionHint ? { mentionHint } : {})
+          : {
+            situation: [
+              buildSituation(situation, {
+                freshConversation: !previousMessages.some(
+                  (message) => message.role === "user",
+                ),
+              }),
+              localAssetContext,
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          }),
         ...(timelineFrames.length ? { timelineFrames } : {}),
+        ...(options.studioAction ? { studioAction: options.studioAction } : {}),
       };
       void sendMessage({
         metadata,
@@ -398,6 +612,7 @@ export function ChatThread({
               },
         ),
       });
+      return true;
     },
     [elements, sendMessage, status],
   );
@@ -407,9 +622,21 @@ export function ChatThread({
   // duplicate edits or immediately hit the old turn's ceiling. Resume as a NEW user turn instead:
   // that gives the server a fresh composition snapshot and resets both execution counters.
   const continueFromCurrentState = useCallback(
-    () => run(t("chatGen.continueAfterInterruptionPrompt")),
+    () => {
+      const studioAction = latestStudioMetaAction(messagesRef.current);
+      return run(t("chatGen.continueAfterInterruptionPrompt"), {
+        ...(studioAction ? { studioAction } : {}),
+      });
+    },
     [run],
   );
+
+  const createScenarioSkill = useCallback(() => {
+    composerRef.current?.beginCreateSkill({
+      label: t("chatGen.skill.create.title"),
+      prompt: t("chatGen.skill.create.prompt"),
+    });
+  }, []);
 
   // Client-side tools may already have committed durable edits before a provider/network stream
   // drops. Retry exactly once as a NEW user turn against the current project snapshot; never replay
@@ -435,8 +662,10 @@ export function ChatThread({
         )
       ) return;
       autoRecoveryAttemptedRef.current = true;
+      const studioAction = latestStudioMetaAction(messagesRef.current);
       run(t("chatGen.continueAfterInterruptionPrompt"), {
         preserveAutoRecoveryAttempt: true,
+        ...(studioAction ? { studioAction } : {}),
       });
     }, 650);
     return () => clearTimeout(timer);
@@ -446,6 +675,7 @@ export function ChatThread({
   // Order matters: flag first so neither the SDK tail check nor our safety net restarts the turn.
   const handleStop = useCallback(() => {
     userStoppedRef.current = true;
+    timelineFrameInspectionRef.current?.abort();
     toolAbortRef.current?.abort();
     void stop();
   }, [stop]);
@@ -468,17 +698,21 @@ export function ChatThread({
 
   const pickStarter = useCallback(
     (nextSkillId: StudioScenarioSkillId, starterId: string, prompt: string) => {
-      setSkillId(nextSkillId);
+      applySkill(nextSkillId);
       setActiveStarterId(`${nextSkillId}:${starterId}`);
       fillComposer(prompt);
     },
-    [fillComposer],
+    [applySkill, fillComposer],
   );
 
   const pickSkill = useCallback((nextSkillId: StudioScenarioSkillId) => {
-    setSkillId(nextSkillId);
+    applySkill(nextSkillId);
     setActiveStarterId(null);
-  }, []);
+    const defaultPrompt = nextSkillId === STUDIO_AUTO_SKILL_ID
+      ? null
+      : scenarioSkills.find((skill) => skill.id === nextSkillId)?.defaultPrompt ?? null;
+    composerRef.current?.applySkillPrompt(defaultPrompt);
+  }, [applySkill, scenarioSkills]);
 
   // Expose "one-tap film" progress + selected pill to the workbench.
   useImperativeHandle(
@@ -633,7 +867,8 @@ export function ChatThread({
             </div>
           ) : (
             messages.map((m, mi) => {
-              const parts = (m.parts ?? []) as ToolPartLike[];
+              const displayMessage = compactStudioChatMessages([m])[0] ?? m;
+              const parts = (displayMessage.parts ?? []) as ToolPartLike[];
               // Collapse consecutive track_export polls (only step-starts between them): render just
               // the last of each run — a polling agent otherwise buries the conversation in a column
               // of identical progress badges. Polls separated by real text keep rendering.
@@ -702,13 +937,61 @@ export function ChatThread({
                 isLast &&
                 status === "ready" &&
                 !assistantMessageHasRenderableOutput(m);
+              const incompleteCompletedAssistant =
+                m.role === "assistant" &&
+                isLast &&
+                status === "ready" &&
+                !emptyCompletedAssistant &&
+                assistantMessageSuggestsContinuation(m);
+              const editorialCapacityShortfall = m.role === "assistant" && (!isLast || status === "ready")
+                ? assistantEditorialCapacityShortfall(m)
+                : null;
+              const workFold = assistantWorkFold(m, !isLast || status === "ready");
+              const workFoldAvailable = workFold !== null;
+              const workExpanded = !collapsedWorkMessages.has(m.id);
+              const workHidden = workFoldAvailable && !workExpanded;
+              const workDurationMs = workFoldAvailable
+                ? assistantWorkDurationMs(messages, mi)
+                : null;
+              const workDurationSeconds = workDurationMs === null
+                ? null
+                : Math.max(1, Math.round(workDurationMs / 1000));
+              const workDuration = workDurationSeconds === null
+                ? null
+                : workDurationSeconds < 60
+                  ? t("chatGen.workDurationSeconds", { s: workDurationSeconds })
+                  : t("chatGen.workDurationMinutes", {
+                      m: Math.floor(workDurationSeconds / 60),
+                      s: workDurationSeconds % 60,
+                    });
               return (
                 <Message key={m.id} from={m.role}>
                   <div className="flex items-start gap-2">
                     {m.role === "assistant" && <PiAvatar thinking={thinking} />}
                     <div className="flex min-w-0 flex-1 flex-col gap-2">
+                      {workFoldAvailable && (
+                        <button
+                          type="button"
+                          aria-expanded={workExpanded}
+                          onClick={() => setCollapsedWorkMessages((current) => {
+                            const next = new Set(current);
+                            if (next.has(m.id)) next.delete(m.id);
+                            else next.add(m.id);
+                            return next;
+                          })}
+                          className="text-ink-3 hover:text-ink flex w-fit items-center gap-1 py-0.5 text-[11px] transition-colors"
+                        >
+                          <ChevronRight
+                            aria-hidden
+                            className={`size-3 transition-transform ${workExpanded ? "rotate-90" : ""}`}
+                          />
+                          <span>{t("chatGen.workUpdates")}</span>
+                          {workDuration && <span>· {workDuration}</span>}
+                        </button>
+                      )}
                       {parts.map((part, idx) => {
                         const key = `${m.id}-${idx}`;
+                        if (workHidden && idx <= (workFold?.lastWorkPartIndex ?? -1)) return null;
                         if (part.type === "step-start") return null;
                         if (collapsed.has(idx)) return null;
                         if (part.type === "text") {
@@ -717,6 +1000,13 @@ export function ChatThread({
                           return m.role === "user" ? (
                             <MessageContent key={key}>
                               <div className="text-[13px] leading-relaxed">
+                                {idx === parts.findIndex((candidate) => candidate.type === "text")
+                                  && (m.metadata as { studioAction?: unknown } | undefined)?.studioAction === STUDIO_CREATE_SKILL_ACTION && (
+                                  <span className={`${CHAT_ACTION_PILL_CLASS} mr-1.5`}>
+                                    <span className={`${CHAT_PILL_ICON_CLASS} text-accent`}>✦</span>
+                                    <span className={CHAT_PILL_LABEL_CLASS}>{t("chatGen.skill.create.title")}</span>
+                                  </span>
+                                )}
                                 {renderTextWithElementPills(text, elements)}
                               </div>
                             </MessageContent>
@@ -814,6 +1104,28 @@ export function ChatThread({
                           </button>
                         </div>
                       )}
+                      {incompleteCompletedAssistant && (
+                        <div className="border-line bg-panel-2 flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-[12px]">
+                          <span className="text-ink-3 min-w-0 flex-1">
+                            {t("chatGen.workNotFinished")}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={continueFromCurrentState}
+                            className="text-ink-2 hover:bg-line hover:text-ink shrink-0 rounded px-1.5 py-0.5 font-medium"
+                          >
+                            {t("chatGen.continueFromCurrentState")}
+                          </button>
+                        </div>
+                      )}
+                      {editorialCapacityShortfall !== null && (
+                        <div className="border-line bg-panel-2 text-ink-3 flex items-start gap-2 rounded-md border px-2.5 py-2 text-[12px] leading-relaxed">
+                          <Info size={13} className="mt-0.5 shrink-0 text-accent" />
+                          <span>
+                            {t("chatGen.editorialCapacityShortfall", { s: editorialCapacityShortfall })}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </Message>
@@ -840,7 +1152,9 @@ export function ChatThread({
               <span className="min-w-0 flex-1 truncate text-destructive">
                 {error.message?.includes("insufficient_tokens")
                   ? t("chatGen.notEnoughCreditsTop")
-                  : t("chatGen.interruptedStatePreserved")}
+                  : error.message?.includes("studio_upstream_busy")
+                    ? t("chatGen.upstreamBusy")
+                    : t("chatGen.interruptedStatePreserved")}
               </span>
               {!error.message?.includes("insufficient_tokens") && (
                 <button
@@ -851,6 +1165,14 @@ export function ChatThread({
                   {t("chatGen.continueFromCurrentState")}
                 </button>
               )}
+            </div>
+          )}
+          {timelineFrameInspectionError && status !== "error" && (
+            <div className="border-destructive/30 bg-destructive/5 text-ink-2 mx-3 mb-2 flex items-center gap-2 rounded-md border px-2.5 py-2 text-[11px]">
+              <X size={12} className="shrink-0 text-destructive" />
+              <span className="min-w-0 flex-1 truncate text-destructive">
+                {t("chatGen.timelineFrameInspectionFailed")}
+              </span>
             </div>
           )}
         </ConversationContent>
@@ -864,7 +1186,8 @@ export function ChatThread({
           elements={elements}
           skillId={skillId}
           scenarioSkills={scenarioSkills}
-          onImportScenarioSkill={onImportScenarioSkill}
+          onOpenSkillMarket={onOpenSkillMarket}
+          onCreateScenarioSkill={onRefreshScenarioSkills ? createScenarioSkill : undefined}
           onDeleteScenarioSkill={onDeleteScenarioSkill}
           onPickSkill={pickSkill}
           frame={frame}

@@ -129,12 +129,28 @@ describe('V2 incremental save wire', () => {
     const acked = ackedFromDto({
       document: current.document!,
       context: sanitizeProjectContext(null),
-      coverThumb: current.coverThumb,
+      coverThumb: current.coverThumb ?? null,
       title: 'Hydrated project',
       videoSig: current.videoSig,
       videoDurationSec: current.videoDurationSec,
     });
 
+    expect(buildSaveWire(current, 7, acked)).toBeNull();
+  });
+
+  it('preserves a server-held cover key when the payload omits coverThumb entirely', () => {
+    const current = payload();
+    delete current.coverThumb;
+    const acked = ackedFromDto({
+      document: current.document!,
+      context: sanitizeProjectContext(null),
+      coverThumb: 'studio-covers/u1/p1-abc.jpg',
+      title: 'Hydrated project',
+      videoSig: current.videoSig,
+      videoDurationSec: current.videoDurationSec,
+    });
+    // Covers travel as bytes through saveCover; an absent field must neither clear the
+    // server's cover key nor register as a changed section (fake no-op PUT churns versions).
     expect(buildSaveWire(current, 7, acked)).toBeNull();
   });
 
@@ -213,14 +229,7 @@ describe('save request boundary', () => {
       },
     })?.context).toEqual({
       schemaVersion: 3,
-      localAssets: [{
-        assetId: expect.stringMatching(/^local_/),
-        contentSig: 'shared.mp4:9:1',
-        sig: 'shared.mp4:9:1',
-        label: 'shared.mp4',
-        kind: 'video',
-        createdAt: 9,
-      }],
+      localAssets: [],
     });
   });
 
@@ -242,25 +251,15 @@ describe('save request boundary', () => {
     });
   });
 
-  it('derives the same legacy asset id on every device and preserves the compatibility sig', () => {
+  it('drops directory entries that carry no logical id instead of deriving one', () => {
     const legacy = {
       schemaVersion: 3,
-      localAssets: [{
-        sig: 'shared.mp4:9:1',
-        label: 'shared.mp4',
-        folder: { id: 'folder-a', name: 'A', path: 'clips/shared.mp4' },
-        createdAt: 9,
-      }],
+      localAssets: [
+        { sig: 'shared.mp4:9:1', label: 'shared.mp4', createdAt: 9 },
+        { assetId: 'local_keep', contentSig: 'kept.mp4:9:1', label: 'kept.mp4', createdAt: 8 },
+      ],
     };
-
-    const first = sanitizeProjectContext(legacy).localAssets?.[0];
-    const second = sanitizeProjectContext(structuredClone(legacy)).localAssets?.[0];
-    expect(first?.assetId).toMatch(/^local_/);
-    expect(second?.assetId).toBe(first?.assetId);
-    expect(first).toMatchObject({
-      contentSig: legacy.localAssets[0]!.sig,
-      sig: legacy.localAssets[0]!.sig,
-    });
+    expect(sanitizeProjectContext(legacy).localAssets?.map((entry) => entry.assetId)).toEqual(['local_keep']);
   });
 
   it('rejects stale/corrupt patches and patched legacy top-level fields', () => {
@@ -293,7 +292,7 @@ describe('conflict baseline', () => {
   it('re-seeds from a server V2 DTO using the same canonical hashes', () => {
     const value = payload();
     const acked = ackedFromDto({
-      document: value.document!, context: { schemaVersion: 3 }, coverThumb: value.coverThumb,
+      document: value.document!, context: { schemaVersion: 3 }, coverThumb: value.coverThumb ?? null,
       title: '未命名项目', videoSig: value.videoSig, videoDurationSec: value.videoDurationSec,
     });
     const next = buildSaveWire(value, 9, acked);

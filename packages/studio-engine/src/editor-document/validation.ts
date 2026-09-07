@@ -1,6 +1,7 @@
 import { isFinitePositive } from './time';
 import { normalizeEditorDocumentArtifacts } from '../director-plan-artifact';
 import { normalizePeerNarrativeSources } from './source-peer-normalization';
+import { pinCaptionsOnTop } from './caption-stack';
 import {
   EDITOR_DOCUMENT_VERSION,
   type EditorDocumentIssue,
@@ -171,10 +172,24 @@ export function validateEditorDocumentV2(document: EditorDocumentV2): EditorDocu
 /** Decode the stable editor envelope, then canonicalize optional artifacts independently. */
 export function parseEditorDocumentV2(value: unknown): EditorDocumentV2 | null {
   if (!isEditorDocumentV2(value)) return null;
-  return normalizePeerNarrativeSources(normalizeEditorDocumentArtifacts(value).document);
+  // Load-time repair: lanes inserted before the caption pin existed could sit above the captions;
+  // the captions come back on top (see caption-stack.ts).
+  return pinCaptionsOnTop(normalizePeerNarrativeSources(normalizeEditorDocumentArtifacts(value).document));
 }
 
 export function editorTimelineTotalFrames(document: EditorDocumentV2): number {
+  const primary = document.timeline.tracks.find(
+    (track) => track.id === document.semantics.primaryNarrativeTrackId,
+  );
+  const primaryEnd = primary?.clips.reduce(
+    (end, clip) => Math.max(end, clip.startFrame + clip.durationFrames),
+    0,
+  ) ?? 0;
+  // Studio outputs are video-led once the primary picture lane has content. Supporting audio,
+  // captions and graphics may keep editable overflow in the document, but they cannot silently
+  // extend the delivered video's duration. Empty-picture drafts retain generic NLE behavior so an
+  // audio- or graphics-first workflow can still be assembled before its primary picture is added.
+  if (primaryEnd > 0) return primaryEnd;
   let end = 0;
   for (const track of document.timeline.tracks) {
     // Visibility/enabled flags affect rendering, not document geometry: a hidden/disabled clip

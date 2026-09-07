@@ -1,6 +1,6 @@
 'use client';
 
-import { alignFileToSig, deleteLocalVideo, saveLocalStream, saveLocalVideo } from './local-media';
+import { alignFileToSig, deleteLocalVideo, loadLocalVideo, saveLocalStream, saveLocalVideo } from './local-media';
 import { fileNameFromSig } from './media';
 
 export interface MaterializedRemoteMedia {
@@ -63,7 +63,11 @@ export async function materializeRemoteMedia(
   const response = await fetchRemote(url, options.signal);
   if (!response.ok || !response.body) throw new Error(`media fetch failed: HTTP ${response.status}`);
 
-  const headerSize = Number(response.headers.get('content-length'));
+  // Number(null) === 0: an ABSENT content-length (chunked/proxied responses stream without one)
+  // must read as "size unknown", never as "expect zero bytes" — that killed every export whose
+  // audio materialized through the same-origin proxy.
+  const headerRaw = response.headers.get('content-length');
+  const headerSize = headerRaw == null || headerRaw.trim() === '' ? Number.NaN : Number(headerRaw);
   const responseSize = Number.isSafeInteger(headerSize) && headerSize >= 0 ? headerSize : null;
   const requestedSig = options.sig?.trim() || null;
   const requestedSize = requestedSig ? sizeFromSig(requestedSig) : null;
@@ -100,9 +104,16 @@ export async function materializeRemoteMedia(
     expectedSize: null,
   });
   const sig = `${durableName}:${temporary.size}:0`;
-  const file = alignFileToSig(temporary, sig);
-  const stored = await saveLocalVideo(file, sig, undefined, { pinned: options.pinned });
+  const stored = await saveLocalVideo(alignFileToSig(temporary, sig), sig, undefined, { pinned: options.pinned });
+  if (!stored) {
+    await deleteLocalVideo(temporarySig);
+    throw new Error('remote media could not be persisted on this device');
+  }
+  // Return a File backed by the DURABLE entry. The temporary-backed File must never escape:
+  // OPFS Files read lazily, so handing it out and then deleting its backing entry made the
+  // export mixer hit NotFoundError at mux time (after the whole video had already rendered).
+  const durable = await loadLocalVideo(sig);
   await deleteLocalVideo(temporarySig);
-  if (!stored) throw new Error('remote media could not be persisted on this device');
-  return { file, sig };
+  if (!durable) throw new Error('remote media could not be persisted on this device');
+  return { file: alignFileToSig(durable, sig), sig };
 }

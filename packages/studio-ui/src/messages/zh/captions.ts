@@ -25,6 +25,7 @@ export const CAPTIONS_ZH: Record<string, string> = {
   'captions.retranslateLine': '重新翻译这句',
   'captions.relayout': '重新排版',
   'captions.relayoutHint': '按当前画布和字号重新划分字幕（可撤销）',
+  'captions.relayoutDone': '已按当前画布重新排版字幕',
   'captions.styles': '样式',
   'captions.transcribeFirst': '先提取口播稿',
   'captions.translateTranscriptIntoLang': '把口播稿翻成{lang},作为第二行字幕',
@@ -44,5 +45,7 @@ export const CAPTIONS_ZH: Record<string, string> = {
   'captions.off': '关闭',
   'captions.fontSize': '字号',
   'captions.bold': '加粗',
+  'captions.fontFamily': '字体',
+  'captions.moreStyle': '更多样式',
   'captions.enableCaptions': '开启字幕',
 };

@@ -10,6 +10,7 @@ import {
 } from '@pireel/studio-engine/composition';
 import { buildChatSystem, buildHtmlSystem } from '@pireel/studio-engine/prompts';
 import type { AgentToolCtx } from './agent-tool-runner';
+import { GeneratedBlockValidationError } from './compose-result';
 import { classifyAsrResponse } from './media';
 import { localAssetMentionId } from './chat-local-asset-mention';
 import { resolveInteraction } from './interaction-store';
@@ -17,9 +18,18 @@ import { resolveInteraction } from './interaction-store';
 const providerMocks = vi.hoisted(() => ({ transcribe: vi.fn() }));
 const mediaMocks = vi.hoisted(() => ({ probeVideoFile: vi.fn() }));
 const visualMocks = vi.hoisted(() => ({ analyzeVisual: vi.fn(), analyzeVisualGeometry: vi.fn() }));
+const editorialReviewMocks = vi.hoisted(() => ({
+  reviewEditorialCandidates: vi.fn(),
+  editorialOpeningEvidence: vi.fn(),
+  compareEditorialOpenings: vi.fn(),
+}));
 const speechMocks = vi.hoisted(() => ({
   assessLocalSpeechAudio: vi.fn(),
   detectSpeechSilenceCuts: vi.fn(),
+}));
+const progressMocks = vi.hoisted(() => ({
+  setToolProgress: vi.fn(),
+  clearToolProgress: vi.fn(),
 }));
 const localMediaMocks = vi.hoisted(() => {
   const loadLocalVideo = vi.fn();
@@ -42,6 +52,11 @@ vi.mock('./visual', async (importOriginal) => ({
   analyzeVisual: visualMocks.analyzeVisual,
   analyzeVisualGeometry: visualMocks.analyzeVisualGeometry,
 }));
+vi.mock('./editorial-review', () => ({
+  reviewEditorialCandidates: editorialReviewMocks.reviewEditorialCandidates,
+  editorialOpeningEvidence: editorialReviewMocks.editorialOpeningEvidence,
+  compareEditorialOpenings: editorialReviewMocks.compareEditorialOpenings,
+}));
 vi.mock('./speech-silence', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./speech-silence')>()),
   assessLocalSpeechAudio: speechMocks.assessLocalSpeechAudio,
@@ -53,6 +68,10 @@ vi.mock('./local-media', async (importOriginal) => ({
   loadLocalAssetFile: localMediaMocks.loadLocalAssetFile,
   loadLocalFolderFile: localMediaMocks.loadLocalFolderFile,
   saveLocalVideo: localMediaMocks.saveLocalVideo,
+}));
+vi.mock('./tool-progress', () => ({
+  setToolProgress: progressMocks.setToolProgress,
+  clearToolProgress: progressMocks.clearToolProgress,
 }));
 
 async function runAtomicCompositionTool(ctx: AgentToolCtx, execute: () => Promise<{ ok: boolean; summary?: string; error?: string }>) {
@@ -117,6 +136,20 @@ describe('Agent composition transaction boundary', () => {
       classification: 'speech-likely', hasAudio: true, audible: true, speechLikely: true,
       audibleSec: 4, speechSec: 1, speechFraction: 0.25,
     });
+    editorialReviewMocks.editorialOpeningEvidence.mockImplementation((file, sourceId, label, candidates) => ({
+      file, sourceId, label, candidate: candidates[0],
+    }));
+    editorialReviewMocks.compareEditorialOpenings.mockImplementation(async (evidence) => ({
+      comparisonSummary: 'Compared together.',
+      contenders: evidence.map((row: { sourceId: string; candidate: { candidateId: string; openingFrameScore: number; openingFrameSec?: number } }, index: number) => ({
+        sourceId: row.sourceId,
+        candidateId: row.candidate.candidateId,
+        rank: index + 1,
+        openingFrameScore: row.candidate.openingFrameScore,
+        openingFrameSec: row.candidate.openingFrameSec,
+        rationale: 'shared comparison',
+      })),
+    }));
   });
 
   afterEach(() => {
@@ -124,6 +157,9 @@ describe('Agent composition transaction boundary', () => {
     mediaMocks.probeVideoFile.mockReset();
     visualMocks.analyzeVisual.mockReset();
     visualMocks.analyzeVisualGeometry.mockReset();
+    editorialReviewMocks.reviewEditorialCandidates.mockReset();
+    editorialReviewMocks.editorialOpeningEvidence.mockReset();
+    editorialReviewMocks.compareEditorialOpenings.mockReset();
     speechMocks.assessLocalSpeechAudio.mockReset();
     speechMocks.detectSpeechSilenceCuts.mockReset();
     localMediaMocks.loadLocalVideo.mockReset();
@@ -131,6 +167,8 @@ describe('Agent composition transaction boundary', () => {
     localMediaMocks.loadLocalAssetFile.mockImplementation(() => localMediaMocks.loadLocalVideo());
     localMediaMocks.loadLocalFolderFile.mockReset();
     localMediaMocks.saveLocalVideo.mockReset();
+    progressMocks.setToolProgress.mockReset();
+    progressMocks.clearToolProgress.mockReset();
     vi.unstubAllGlobals();
   });
 
@@ -172,6 +210,45 @@ describe('Agent composition transaction boundary', () => {
       retryable: true,
       detail: 'Failed to fetch',
     });
+  });
+
+  it('atomically replaces a prepared primary montage without retaining frame slivers', async () => {
+    const h = harness();
+    let document = runAgentTimelineTool(h.documentRef.current, 'register_media', {
+      assets: [
+        { id: 'old-video', kind: 'video', url: 'https://cdn.example/old.mp4', durationSec: 5 },
+        { id: 'new-video', kind: 'video', url: 'https://cdn.example/new.mp4', durationSec: 5 },
+        { id: 'narration', kind: 'audio', url: 'https://cdn.example/narration.mp3', durationSec: 5 },
+      ],
+    }).document!;
+    document = runAgentTimelineTool(document, 'add_clips', {
+      clips: [
+        { id: 'old-picture', role: 'primary', assetId: 'old-video', startSec: 0, sourceInSec: 0, sourceOutSec: 5 },
+        { id: 'voice', role: 'narration', assetId: 'narration', startSec: 0, sourceInSec: 0, sourceOutSec: 5 },
+      ],
+    }).document!;
+    h.documentRef.current = document;
+    h.compRef.current = projectDocumentToComposition(document);
+    Object.assign(h.ctx, {
+      projectId: 'test',
+      genIdsRef: { current: new Set<string>() },
+      pushUndoSnapshot: () => {},
+    });
+    const { runStudioTool } = await import('./agent-tool-runner');
+    const result = await runStudioTool(h.ctx, 'add_clips', {
+      __replacePrimaryTrack: true,
+      clips: [{
+        id: 'new-picture', role: 'primary', assetId: 'new-video', startSec: 1 / 30,
+        sourceInSec: 0, sourceOutSec: 149 / 30,
+      }],
+    });
+
+    expect(result.ok).toBe(true);
+    const primary = h.documentRef.current.timeline.tracks.find((track) => track.role === 'primaryNarrative')!;
+    expect(primary.clips).toHaveLength(1);
+    expect(primary.clips[0]).toMatchObject({ id: 'new-picture', startFrame: 1, durationFrames: 149 });
+    expect(primary.clips.some((clip) => clip.id === 'old-picture')).toBe(false);
+    expect(h.documentRef.current.timeline.tracks.find((track) => track.role === 'narration')?.clips).toHaveLength(1);
   });
 
   it('returns the stable value for an ask_user voice choice', async () => {
@@ -226,64 +303,77 @@ describe('Agent composition transaction boundary', () => {
     }));
   });
 
-  it('does not generate or charge speech when the exact script and voice card is rejected', async () => {
+  it('generates speech directly without parking on a second approval card', async () => {
     const h = harness();
-    const fetchMock = vi.fn().mockResolvedValueOnce(Response.json({
-      ok: true,
-      quote: { credits: 1, charCount: 8, estimatedDurationSec: 2.5, textLengthTier: 'short' },
-    }));
+    // The derived-cache L2 probes fetch first (miss); route by URL so those probes stay inert.
+    const fetchMock = vi.fn().mockImplementation((url: unknown) => Promise.resolve(
+      String(url).startsWith('/api/studio/derived-cache')
+        ? Response.json({ ok: true, payload: null })
+        : Response.json({
+            ok: true,
+            asset: {
+              id: 'speech-direct', kind: 'audio', key: 'speech.mp3', url: 'https://cdn.example/speech.mp3', mime: 'audio/mpeg',
+              model: 'speech-2.8-hd', voiceId: 'system:Chinese (Mandarin)_Reliable_Executive', voiceLabel: 'Reliable Executive',
+              transcriptText: '现在就试试看。', charCount: 8, durationSec: 2.4, estimatedDurationSec: 2.5,
+            },
+          }),
+    ));
     vi.stubGlobal('fetch', fetchMock);
     const { runStudioTool } = await import('./agent-tool-runner');
-    const pending = runStudioTool(h.ctx, 'generate_speech', {
+    const result = await runStudioTool(h.ctx, 'generate_speech', {
       text: '现在就试试看。',
       voiceId: 'system:Chinese (Mandarin)_Reliable_Executive',
       instruction: '自然、直接，不要播音腔',
+      emotion: 'calm',
+      pauseStyle: 'spacious',
+      pauses: [{ afterText: '现在就', durationSec: 0.5 }],
     }, { surface: 'chat' });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    resolveInteraction('rejected');
 
-    await expect(pending).resolves.toMatchObject({
+    expect(result).toMatchObject({
       ok: true,
-      data: { decision: 'rejected' },
+      data: { asset: { id: 'speech-direct' } },
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith('/api/studio/speech', expect.objectContaining({
-      body: expect.stringContaining('"action":"quote"'),
-    }));
+    const speechCalls = fetchMock.mock.calls.filter(([url]) => String(url) === '/api/studio/speech');
+    expect(speechCalls).toHaveLength(1);
+    expect(String(speechCalls[0]?.[1]?.body)).not.toContain('"action":"quote"');
+    expect(String(speechCalls[0]?.[1]?.body)).toContain('"pauseStyle":"spacious"');
   });
 
-  it('generates speech only after the exact charge card is approved', async () => {
+  it('marks rejected approval receipts as a hard agent-turn boundary', async () => {
+    const { studioToolResultStopsAgentTurn } = await import('./agent-tool-runner');
+    expect(studioToolResultStopsAgentTurn({ ok: true, data: { decision: 'rejected' } })).toBe(true);
+    expect(studioToolResultStopsAgentTurn({ ok: true, data: { decision: 'approved' } })).toBe(false);
+    expect(studioToolResultStopsAgentTurn({ ok: false, data: { decision: 'rejected' } })).toBe(false);
+  });
+
+  it('also generates speech directly from the bridge execution surface', async () => {
     const h = harness();
-    const fetchMock = vi.fn()
-      .mockResolvedValueOnce(Response.json({
-        ok: true,
-        quote: { credits: 1, charCount: 8, estimatedDurationSec: 2.5, textLengthTier: 'short' },
-      }))
-      .mockResolvedValueOnce(Response.json({
-        ok: true,
-        asset: {
-          id: 'speech-1', kind: 'audio', key: 'speech.mp3', url: 'https://cdn.example/speech.mp3', mime: 'audio/mpeg',
-          model: 'speech-2.8-hd', voiceId: 'system:Chinese (Mandarin)_Reliable_Executive', voiceLabel: 'Reliable Executive',
-          transcriptText: '现在就试试看。', charCount: 8, durationSec: 2.4, estimatedDurationSec: 2.5,
-        },
-      }));
+    const fetchMock = vi.fn().mockImplementation((url: unknown) => Promise.resolve(
+      String(url).startsWith('/api/studio/derived-cache')
+        ? Response.json({ ok: true, payload: null })
+        : Response.json({
+            ok: true,
+            asset: {
+              id: 'speech-1', kind: 'audio', key: 'speech.mp3', url: 'https://cdn.example/speech.mp3', mime: 'audio/mpeg',
+              model: 'speech-2.8-hd', voiceId: 'system:Chinese (Mandarin)_Reliable_Executive', voiceLabel: 'Reliable Executive',
+              transcriptText: '现在就试试看。', charCount: 8, durationSec: 2.4, estimatedDurationSec: 2.5,
+            },
+          }),
+    ));
     vi.stubGlobal('fetch', fetchMock);
     const { runStudioTool } = await import('./agent-tool-runner');
-    const pending = runStudioTool(h.ctx, 'generate_speech', {
+    const result = await runStudioTool(h.ctx, 'generate_speech', {
       text: '现在就试试看。',
       voiceId: 'system:Chinese (Mandarin)_Reliable_Executive',
-    }, { surface: 'chat' });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    resolveInteraction('approved');
+    }, { surface: 'bridge' });
 
-    await expect(pending).resolves.toMatchObject({
+    expect(result).toMatchObject({
       ok: true,
       data: { asset: { id: 'speech-1' }, voiceLabel: 'Reliable Executive' },
     });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1]?.[1]).toEqual(expect.objectContaining({
-      body: expect.not.stringContaining('"action":"quote"'),
-    }));
+    const speechCalls = fetchMock.mock.calls.filter(([url]) => String(url) === '/api/studio/speech');
+    expect(speechCalls).toHaveLength(1);
+    expect(String(speechCalls[0]?.[1]?.body)).not.toContain('"action":"quote"');
   });
 
   it('routes designed voices through the shared voice API', async () => {
@@ -336,16 +426,12 @@ describe('Agent composition transaction boundary', () => {
     const result = await runStudioTool(h.ctx, 'read_script', {});
     expect(result).toMatchObject({ ok: false, error: '提取口播稿失败,稍后再试' });
 
-    const skill = readFileSync(new URL('../../../../src/lib/studio/scenario-skills/talking-head-edit/SKILL.md', import.meta.url), 'utf8');
+    const skill = readFileSync(new URL('../../studio-engine/src/scenario-skills/content/talking-head-edit/SKILL.md', import.meta.url), 'utf8');
     const execute = skill.slice(skill.indexOf('## Step 10: Execute with tool discipline'));
-    expect(execute).toContain('After Approve, run `remove_silence` first');
+    expect(execute).toContain('Place the narration spine first, then run `remove_silence`');
     expect(execute).toContain('do not retry it in the same user request');
-    expect(buildChatSystem(null)).toContain('run remove_silence first when dead-air cleanup is in scope');
-    expect(buildChatSystem(null)).toContain('do not call it again in the same user request');
-    expect(buildChatSystem(null)).toContain('Build one cross-media evidence map before approval');
-    expect(buildChatSystem(null)).toContain('repetition used only to fill uncovered time is a planning failure');
-    expect(buildChatSystem(null)).toContain('compare actual clip ownership and media coverage');
-    expect(buildChatSystem(null)).toContain('Scope, not the reversibility of each individual edit atom, decides whether this is whole-video work');
+    expect(buildChatSystem(null)).toContain('run remove_silence before transcript-driven edits');
+    expect(buildChatSystem(null)).not.toContain('planning artifact');
   });
 
   it('prepares every referenced device-local media asset before clips are committed', async () => {
@@ -485,6 +571,45 @@ describe('Agent composition transaction boundary', () => {
     expect(unplannedReviewAtSecs(withText.document!)).toEqual([2, 6]);
   });
 
+  it('run_v3 answers get_state in the v3 shape and applies a mutation as one delta-bearing step', async () => {
+    const h = harness();
+    h.ctx.setDocument(emptyEditorDocumentV2({ width: 1080, height: 1920, fps: 30 }));
+    const first = new File(['first'], 'first.mov', { type: 'video/quicktime', lastModified: 1 });
+    mediaMocks.probeVideoFile.mockResolvedValueOnce({ durationSec: 4, width: 1080, height: 1920, hasAudio: true });
+    Object.assign(h.ctx, {
+      localAssetIndexRef: { current: [localEntry('first-video', 'first:sig', '第一段', 'video')] },
+      prepareLocalAssetRuntime: vi.fn(async () => ({ ok: true, prepared: true, file: first })),
+      pickVideoFile: vi.fn().mockResolvedValue(undefined),
+      genIdsRef: { current: new Set<string>() },
+      pushUndoSnapshot: () => { h.ctx.undoStackRef.current = [...h.ctx.undoStackRef.current, h.ctx.documentRef.current]; },
+    });
+    const { runExternalTool } = await import('./agent-tool-runner');
+    const placed = await runExternalTool(h.ctx, 'add_clips', { clips: [{ assetId: 'local:first-video', role: 'primary', startSec: 0 }] });
+    expect(placed.ok, JSON.stringify(placed)).toBe(true);
+
+    const state = await runExternalTool(h.ctx, 'run_v3', { name: 'get_state', args: {} });
+    expect(state.ok).toBe(true);
+    const view = state.data as { canvas: { fps: number }; tracks: Array<{ clips?: Array<{ id: string; frames: [number, number] }> }>; playhead: number };
+    expect(view.canvas.fps).toBe(30);
+    expect(view.tracks.some((track) => track.clips?.some((clip) => Array.isArray(clip.frames)))).toBe(true);
+    expect(JSON.stringify(view)).not.toMatch(/"shots"|"blocks"|startSec/);
+
+    const added = await runExternalTool(h.ctx, 'run_v3', { name: 'set_texts', args: { items: [{ text: 'Hook', startFrame: 6, durationFrames: 90, preset: 'headline' }] } });
+    expect(added.ok, JSON.stringify(added)).toBe(true);
+    const data = added.data as { delta?: { clips?: Array<{ kind: string; frames: [number, number] }> }; steps: unknown[] };
+    expect(data.steps).toHaveLength(1);
+    expect(data.delta?.clips?.some((clip) => clip.frames[0] === 6), JSON.stringify(added).slice(0, 600)).toBe(true);
+    expect(JSON.stringify(data.delta)).not.toContain('blocksAdded');
+
+    // Two legacy steps (set_shot_audio + set_video_speed) collapse into ONE undo step and one delta.
+    const primaryId = view.tracks.flatMap((track) => track.clips ?? []).find((clip) => (clip as { kind?: string }).kind === 'narrative')!.id;
+    const undoBefore = h.ctx.undoStackRef.current.length;
+    const patched = await runExternalTool(h.ctx, 'run_v3', { name: 'set_clip_properties', args: { items: [{ clipId: primaryId, volumeDb: -6, speed: 0.5 }] } });
+    expect(patched.ok, JSON.stringify(patched).slice(0, 600)).toBe(true);
+    expect((patched.data as { steps: unknown[] }).steps).toHaveLength(2);
+    expect(h.ctx.undoStackRef.current.length).toBe(undoBefore + 1);
+  });
+
   it('lists project-local assets without exposing device storage locators', async () => {
     const h = harness();
     const assetId = 'shared-product-video';
@@ -561,13 +686,15 @@ describe('Agent composition transaction boundary', () => {
   });
 
   it('keeps speech edits visually directed without an implicit Smart Select frame', () => {
-    const skill = readFileSync(new URL('../../../../src/lib/studio/scenario-skills/talking-head-edit/SKILL.md', import.meta.url), 'utf8');
+    const skill = readFileSync(new URL('../../studio-engine/src/scenario-skills/content/talking-head-edit/SKILL.md', import.meta.url), 'utf8');
     expect(skill).not.toContain('Smart Select');
     expect(skill).not.toContain('attach `editorial-pulse`');
-    expect(skill).toContain('picture-change contract');
+    expect(skill).toContain('meaningful new visual anchor roughly every 5–10 seconds');
+    expect(skill).toContain('Compile those decisions directly into the timeline');
+    expect(skill).not.toContain('picture-change contract');
     expect(skill).toContain('roughly every 5–10 seconds');
     expect(skill).toContain('never loop or stretch one short clip as wallpaper');
-    expect(skill).toContain('inspect local images with `inspect_images`, then place them by assetId');
+    expect(skill).toContain('place only the chosen footage, stills, or audio by asset id');
 
     const componentSystem = buildHtmlSystem({ componentIds: [] });
     expect(componentSystem).toContain('participating in a video scene');
@@ -699,7 +826,7 @@ describe('Agent composition transaction boundary', () => {
         transcript: expect.stringContaining('先用结果抓住观众'),
       },
     });
-    expect(providerMocks.transcribe).toHaveBeenCalledWith(video);
+    expect(providerMocks.transcribe).toHaveBeenCalledWith(video, expect.anything());
     expect(localMediaMocks.saveLocalVideo).toHaveBeenCalledWith(video, sig, undefined, {
       pinned: false,
       binding: { projectId: 'test', assetId },
@@ -952,6 +1079,7 @@ describe('Agent composition transaction boundary', () => {
         speechLikely: true,
         sceneCutsSec: [6],
         segments: [{ description: 'Hands demonstrate the product.' }],
+        note: expect.stringContaining('Content description only'),
       },
     });
     expect(Object.keys(h.documentRef.current.assets)).toEqual(assetIdsBefore);
@@ -1079,11 +1207,209 @@ describe('Agent composition transaction boundary', () => {
         analysisMode: 'local-geometry',
         sceneCutsSec: [4],
         subjectTracks: [{ subject: { coordinateSpace: 'source-normalized' } }],
+        note: expect.stringContaining('Measurements only'),
       },
     });
     expect((result as { data?: Record<string, unknown> }).data).not.toHaveProperty('segments');
     expect(visualMocks.analyzeVisualGeometry).toHaveBeenCalled();
     expect(visualMocks.analyzeVisual).not.toHaveBeenCalled();
+  });
+
+  it('compares temporal candidates under an explicit editorial brief', async () => {
+    const h = harness();
+    const sig = 'female-lead.mp4:160:8';
+    const video = new File(['video-bytes'], 'female-lead.mp4', { type: 'video/mp4', lastModified: 8 });
+    localMediaMocks.loadLocalVideo.mockResolvedValue(video);
+    mediaMocks.probeVideoFile.mockResolvedValue({ durationSec: 20, width: 1080, height: 1920, hasAudio: true });
+    visualMocks.analyzeVisualGeometry.mockResolvedValue({
+      cuts: [],
+      segments: [{ start: 0, end: 20, label: { content: 'broll', person: 'center', safe: 'top', hasText: false, desc: '' } }],
+      qualityWindows: [{
+        rank: 1, startSec: 4, endSec: 6, score: 88, sharpness: 0.9, exposure: 0.86, stability: 0.87, sampleCount: 4,
+        worstFrameScore: 84, edgeScore: 86, hardFailureFraction: 0,
+      }],
+    });
+    editorialReviewMocks.reviewEditorialCandidates.mockResolvedValue({
+      brief: 'Confident, restrained female-lead footage; compare hook and ending suitability.',
+      comparisonSummary: 'The intentional pose is stronger than the preparatory walk.',
+      candidates: [{
+        candidateId: 'candidate-1', startSec: 4, endSec: 6, rank: 1, verdict: 'strong', score: 92,
+        action: 'walks forward and settles her gaze', rationale: 'complete confident action',
+        openingFrameScore: 96, openingFrameSec: 5.2, openingFrameState: 'closed-mouth frontal portrait',
+        roleFit: [{ role: 'hook', score: 94 }], issues: [],
+        scoreBreakdown: { subjectClarity: 92, aestheticFit: 90, composition: 88, temporalCompleteness: 94, editability: 95 },
+        actionPhases: [], rejectedRanges: [], entryState: '', exitState: '', cameraMotion: '', subjectPlacement: '', bestUse: '',
+      }],
+    });
+    Object.assign(h.ctx, {
+      projectId: 'test',
+      localAssetIndexRef: { current: [localEntry('asset-female-lead', sig, '人物素材', 'video')] },
+      genIdsRef: { current: new Set<string>() },
+      pushUndoSnapshot: () => {},
+    });
+    const { runStudioTool } = await import('./agent-tool-runner');
+    const result = await runStudioTool(h.ctx, 'analyze_visual', {
+      assetId: 'asset-female-lead',
+      mode: 'editorial',
+      brief: 'Confident, restrained female-lead footage; compare hook and ending suitability.',
+      maxCandidates: 4,
+    });
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        analysisMode: 'editorial-candidates',
+        editorialComparisonSummary: expect.stringContaining('intentional pose'),
+        editorialCandidates: [{ candidateId: 'candidate-1', verdict: 'strong', roleFit: [{ role: 'hook' }] }],
+        note: expect.stringContaining('Editorial verdicts per candidate'),
+      },
+    });
+    expect(editorialReviewMocks.reviewEditorialCandidates).toHaveBeenCalledWith(
+      video,
+      expect.arrayContaining([expect.objectContaining({ startSec: 4, endSec: 6 })]),
+      expect.stringContaining('Confident'),
+      expect.objectContaining({ maxCandidates: 4 }),
+    );
+    expect(visualMocks.analyzeVisual).not.toHaveBeenCalled();
+    expect(speechMocks.assessLocalSpeechAudio).not.toHaveBeenCalled();
+  });
+
+  it('reviews all editorial sources once through one bounded-concurrency batch', async () => {
+    const h = harness();
+    const first = new File(['first'], 'first.mp4', { type: 'video/mp4', lastModified: 1 });
+    const second = new File(['second'], 'second.mp4', { type: 'video/mp4', lastModified: 2 });
+    localMediaMocks.loadLocalAssetFile.mockImplementation(async (...args: unknown[]) => {
+      const entry = args[1] as { assetId?: string } | undefined;
+      return entry?.assetId === 'asset-first' ? first : second;
+    });
+    mediaMocks.probeVideoFile.mockResolvedValue({ durationSec: 12, width: 1080, height: 1920, hasAudio: true });
+    const visualTimeline = {
+      cuts: [],
+      segments: [{ start: 0, end: 12, label: { content: 'broll', person: 'center', safe: 'top', hasText: false, desc: '' } }],
+      qualityWindows: [{
+        rank: 1, startSec: 3, endSec: 5, score: 88, sharpness: 0.9, exposure: 0.86, stability: 0.87,
+        sampleCount: 4, worstFrameScore: 84, edgeScore: 86, hardFailureFraction: 0,
+      }],
+    };
+    visualMocks.analyzeVisualGeometry.mockImplementation(async (
+      _file: File,
+      _duration: number,
+      onProgress: (done: number, total: number) => void,
+    ) => {
+      onProgress(1, 2);
+      onProgress(2, 2);
+      return visualTimeline;
+    });
+    let started = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    editorialReviewMocks.reviewEditorialCandidates.mockImplementation(async () => {
+      started += 1;
+      await gate;
+      return {
+        brief: 'Choose complete, polished performance ranges.',
+        comparisonSummary: 'One usable performance range.',
+        candidates: [{
+          candidateId: 'candidate-1', startSec: 3, endSec: 5, rank: 1, verdict: 'usable', score: 88,
+          contentRole: 'person-primary',
+          action: 'settles into a pose', rationale: 'complete action', openingFrameScore: 88,
+          openingFrameSec: 3.2, openingFrameState: 'stable', roleFit: [{ role: 'body', score: 88 }], issues: [],
+          scoreBreakdown: { subjectClarity: 88, aestheticFit: 88, composition: 88, temporalCompleteness: 88, editability: 88 },
+          actionPhases: [], rejectedRanges: [], entryState: '', exitState: '', cameraMotion: '', subjectPlacement: '', bestUse: '',
+          cutOptions: [{ durationSec: 2, startSec: 3, endSec: 5, score: 88, reason: 'complete action' }],
+        }],
+      };
+    });
+    editorialReviewMocks.compareEditorialOpenings.mockImplementation(async (evidence) => ({
+      comparisonSummary: '第二段在共同对比中开场更强。',
+      contenders: [
+        {
+          sourceId: evidence[1].sourceId,
+          candidateId: evidence[1].candidate.candidateId,
+          rank: 1,
+          openingFrameScore: 96,
+          openingFrameSec: 3.4,
+          rationale: 'cleaner immediate presence',
+        },
+        {
+          sourceId: evidence[0].sourceId,
+          candidateId: evidence[0].candidate.candidateId,
+          rank: 2,
+          openingFrameScore: 84,
+          openingFrameSec: 3.2,
+          rationale: 'usable later',
+        },
+      ],
+    }));
+    Object.assign(h.ctx, {
+      projectId: 'test',
+      localAssetIndexRef: { current: [
+        localEntry('asset-first', 'first:sig', '第一段', 'video'),
+        localEntry('asset-second', 'second:sig', '第二段', 'video'),
+      ] },
+      genIdsRef: { current: new Set<string>() },
+      pushUndoSnapshot: () => {},
+    });
+    const { runStudioTool } = await import('./agent-tool-runner');
+    const pending = runStudioTool(h.ctx, 'analyze_visual', {
+      mode: 'editorial',
+      brief: 'Choose complete, polished performance ranges.',
+      compareOpenings: true,
+      items: [{ assetId: 'asset-first' }, { assetId: 'asset-second' }],
+    });
+    await vi.waitFor(() => expect(started).toBe(2));
+    release();
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      ok: true,
+      data: {
+        analysisMode: 'editorial-batch',
+        acceptedDurationSec: 4,
+        items: [
+          { ok: true, localAssetId: 'asset-first', editorialCandidates: [{ verdict: 'usable', openingComparisonRank: 2, openingFrameScore: 84 }] },
+          { ok: true, localAssetId: 'asset-second', editorialCandidates: [{ verdict: 'usable', openingComparisonRank: 1, openingFrameScore: 96 }] },
+        ],
+        openingComparison: {
+          contenders: [
+            { sourceId: 'asset-second', rank: 1, openingFrameScore: 96 },
+            { sourceId: 'asset-first', rank: 2, openingFrameScore: 84 },
+          ],
+        },
+        note: expect.stringContaining('openingComparison ranks the opening'),
+      },
+    });
+    expect(visualMocks.analyzeVisualGeometry).toHaveBeenCalledTimes(2);
+    expect(editorialReviewMocks.reviewEditorialCandidates).toHaveBeenCalledTimes(2);
+    expect(editorialReviewMocks.compareEditorialOpenings).toHaveBeenCalledOnce();
+    const fractions = progressMocks.setToolProgress.mock.calls
+      .map(([progress]) => progress.frac as number)
+      .filter((value) => typeof value === 'number');
+    expect(fractions.length).toBeGreaterThan(2);
+    expect(fractions.every((value, index) => index === 0 || value >= fractions[index - 1]!)).toBe(true);
+    expect(fractions.at(-1)).toBe(1);
+    expect(progressMocks.setToolProgress).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'analyze_visual',
+      text: expect.stringContaining('第一段'),
+    }));
+    expect(progressMocks.setToolProgress).toHaveBeenLastCalledWith(expect.objectContaining({
+      frac: 1,
+      items: [
+        expect.objectContaining({ label: '第一段', frac: 1 }),
+        expect.objectContaining({ label: '第二段', frac: 1 }),
+      ],
+    }));
+    expect(progressMocks.clearToolProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it('requires a concrete brief for editorial candidate review', async () => {
+    const h = harness();
+    Object.assign(h.ctx, { projectId: 'test', genIdsRef: { current: new Set<string>() }, pushUndoSnapshot: () => {} });
+    const { runStudioTool } = await import('./agent-tool-runner');
+    const result = await runStudioTool(h.ctx, 'analyze_visual', { mode: 'editorial' });
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining('requires a concrete brief') });
+    expect(visualMocks.analyzeVisualGeometry).not.toHaveBeenCalled();
+    expect(editorialReviewMocks.reviewEditorialCandidates).not.toHaveBeenCalled();
   });
 
   it('transcribes a targeted registered audio asset without requiring a main video', async () => {
@@ -1118,13 +1444,18 @@ describe('Agent composition transaction boundary', () => {
 
     expect(result).toMatchObject({
       ok: true,
-      data: { assetId: 'tts-audio', durationSec: 12.4, transcript: expect.stringContaining('实际发音') },
+      // Script-backed speech: the exact text is immutable, ASR only measures its timing.
+      data: { assetId: 'tts-audio', durationSec: 12.4, transcript: expect.stringContaining('原始文稿') },
     });
-    expect(providerMocks.transcribe).toHaveBeenCalledWith(expect.objectContaining({ type: 'audio/mpeg' }));
-    expect(h.documentRef.current.assets['tts-audio']?.metadata).toMatchObject({ durationSec: 12.4, hasAudio: true });
-    expect(h.documentRef.current.semantics.transcripts['tts-audio']).toEqual([
-      { start: 0.2, end: 1.4, text: '实际发音', words: [{ start: 0.2, end: 0.8, text: '实际' }] },
-    ]);
+    expect(result.data).toMatchObject({ transcript: expect.not.stringContaining('实际发音') });
+    expect(providerMocks.transcribe).toHaveBeenCalledWith(expect.objectContaining({ type: 'audio/mpeg' }), expect.anything());
+    expect(h.documentRef.current.assets['tts-audio']?.metadata).toMatchObject({ durationSec: 12.4, hasAudio: true, transcriptText: '原始文稿' });
+    const measured = h.documentRef.current.semantics.transcripts['tts-audio']!;
+    expect(measured).toHaveLength(1);
+    expect(measured[0]).toMatchObject({ text: '原始文稿' });
+    expect(measured[0]!.start).toBeCloseTo(0.2, 6);
+    expect(measured[0]!.end).toBeCloseTo(0.8, 6);
+    expect(measured[0]!.words?.map((word) => word.text).join('')).toBe('原始文稿');
     const placed = runAgentTimelineTool(h.documentRef.current, 'add_clips', {
       clips: [{ id: 'narration-clip', assetId: 'tts-audio', role: 'narration', startSec: 0 }],
     });
@@ -1172,7 +1503,7 @@ describe('Agent composition transaction boundary', () => {
       ok: true,
       data: { assetId: 'speaker-video', durationSec: 18, transcript: expect.stringContaining('这是视频里的口播') },
     });
-    expect(providerMocks.transcribe).toHaveBeenCalledWith(expect.objectContaining({ type: 'video/mp4' }));
+    expect(providerMocks.transcribe).toHaveBeenCalledWith(expect.objectContaining({ type: 'video/mp4' }), expect.anything());
     expect(h.documentRef.current.semantics.transcripts['speaker-video']).toEqual([
       { start: 0.4, end: 2.1, text: '这是视频里的口播' },
     ]);
@@ -1417,6 +1748,37 @@ describe('Agent composition transaction boundary', () => {
       templateId: 'custom',
       box: { x: 0.14, y: 0.3, w: 0.72, h: 0.4 },
     });
+  });
+
+  it('returns actionable generated-block lint failures with the complete retry input', async () => {
+    const h = harness();
+    Object.assign(h.ctx, {
+      genIdsRef: { current: new Set<string>() },
+      pushUndoSnapshot: () => h.undoStackRef.current.push(h.documentRef.current),
+      tRef: { current: 0 },
+      composeBlockChecked: async () => {
+        throw new GeneratedBlockValidationError('生成的动态图形没通过检查: letter-spacing 超限', ['letter-spacing 超限']);
+      },
+      noteOf: () => '',
+    });
+    const { runStudioTool } = await import('./agent-tool-runner');
+    const input = {
+      instruction: '做一个关系图', atSec: 8.8, durationSec: 3,
+      placement: { xPct: 12, yPct: 18, widthPct: 70, heightPct: 24 },
+      backdrop: '人物在画面右侧',
+    };
+    const result = await runStudioTool(h.ctx, 'add_block', input);
+    expect(result).toMatchObject({
+      ok: false,
+      error: expect.stringContaining('letter-spacing'),
+      data: {
+        code: 'generated-block-static-checks',
+        issues: ['letter-spacing 超限'],
+        retryInput: input,
+        retryHint: expect.stringContaining('preserve every original timing'),
+      },
+    });
+    expect(h.compRef.current.blocks).toHaveLength(0);
   });
 
   it('stops a pending add_block without letting its late result mutate the timeline', async () => {

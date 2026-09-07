@@ -8,6 +8,7 @@ import {
   applyEditorCommand,
   editorTimelineTotalFrames,
   positiveDurationFrames,
+  retimeEditorClip,
   secondsToTimelineFrames,
   timelineFramesToSeconds,
   type AudioTimelineClip,
@@ -29,6 +30,8 @@ import { directorPlanFromDocument } from './director-plan-artifact';
 import { directorPlanToMarkdown } from './director-plan-markdown';
 import { sceneDesignsFromDocument, sceneDesignsToMarkdown } from './scene-design';
 import { canvasSizeFollowingFirstVideo } from './editing-primitives';
+import { placementPercentToBox } from './overlay-placement';
+import { isDisplayTextAnimationId, isDisplayTextFontId, isDisplayTextPresetId } from './display-text-presets';
 
 export const AGENT_TIMELINE_TOOL_IDS = new Set([
   'get_timeline',
@@ -79,8 +82,23 @@ function sec(value: unknown, fallback = 0): number {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function frameDeltaSec(frames: number, fps: number): number {
+  return Number.isFinite(frames) && Number.isFinite(fps) && fps > 0 ? frames / fps : 0;
+}
+
 function string(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function freeGraphicsStackOrder(document: EditorDocumentV2, startSec: number, durationSec: number): number {
+  const startFrame = secondsToTimelineFrames(startSec, document.canvas.fps);
+  const endFrame = startFrame + positiveDurationFrames(durationSec, document.canvas.fps);
+  for (let stackOrder = 2; ; stackOrder++) {
+    const track = document.timeline.tracks.find((candidate) => candidate.type === 'graphics' && candidate.stackOrder === stackOrder);
+    if (!track || !track.clips.some((clip) => clip.startFrame < endFrame && clip.startFrame + clip.durationFrames > startFrame)) {
+      return stackOrder;
+    }
+  }
 }
 
 function mediaBox(value: unknown): { x: number; y: number; w: number; h: number } | undefined {
@@ -104,7 +122,7 @@ function uniqueId(stem: string, used: ReadonlySet<string>): string {
   return id;
 }
 
-function splitSpeechSentences(text: string): string[] {
+export function splitSpeechSentences(text: string): string[] {
   const normalized = text.trim().replace(/\s+/g, ' ');
   if (!normalized) return [];
   return normalized.match(/[^。！？!?；;\n]+[。！？!?；;]?/g)?.map((part) => part.trim()).filter(Boolean) ?? [normalized];
@@ -120,18 +138,25 @@ export function transcriptFromExactText(text: string, durationSec: number): Tran
   let cursor = 0;
   return sentences.map((sentence, index) => {
     const end = index === sentences.length - 1 ? duration : cursor + duration * (weights[index]! / total);
-    const segment = { start: cursor, end, text: sentence };
+    const segment: TranscriptSegment = { start: cursor, end, text: sentence, scripted: true };
     cursor = end;
     return segment;
   });
 }
 
 function clipForAgent(clip: TimelineClip, fps: number) {
+  const durationSec = timelineFramesToSeconds(clip.durationFrames, fps);
+  const sourceInSec = 'sourceInSec' in clip ? Number(clip.sourceInSec) : NaN;
+  const sourceOutSec = 'sourceOutSec' in clip ? Number(clip.sourceOutSec) : NaN;
+  const playbackSpeed = Number.isFinite(sourceInSec) && Number.isFinite(sourceOutSec)
+    ? (sourceOutSec - sourceInSec) / Math.max(1 / fps, durationSec)
+    : undefined;
   return {
     ...clip,
     startSec: timelineFramesToSeconds(clip.startFrame, fps),
-    durationSec: timelineFramesToSeconds(clip.durationFrames, fps),
+    durationSec,
     endSec: timelineFramesToSeconds(clip.startFrame + clip.durationFrames, fps),
+    ...(playbackSpeed != null ? { playbackSpeed } : {}),
   };
 }
 
@@ -235,6 +260,7 @@ function importAssets(document: EditorDocumentV2, input: Input): AgentTimelineOu
       ...(string(item.description) ? { description: string(item.description) } : {}),
       ...(Array.isArray(item.tags) ? { tags: item.tags.map(string).filter((tag): tag is string => !!tag).slice(0, 30) } : {}),
       ...(string(item.collection) ? { collection: string(item.collection) } : {}),
+      ...(string(item.transcriptText) ? { transcriptText: string(item.transcriptText)! } : {}),
       ...(sec(item.bpm, -1) > 0 ? { bpm: sec(item.bpm) } : {}),
       ...(Number.isFinite(Number(item.beatOffsetSec)) ? { beatOffsetSec: Math.max(0, sec(item.beatOffsetSec)) } : {}),
     };
@@ -340,6 +366,32 @@ function ensureTrack(
     return { document: allocated.document, track: allocated.track, receipts: allocated.receipts };
   }
   const useFreeLane = !!placement && desired.type === 'visual' && desired.role !== 'primaryNarrative';
+  if (useFreeLane && asset.kind === 'video' && item.box === undefined) {
+    // A full-frame B-roll video never stacks on another full-frame B-roll video: the upper lane hides
+    // the lower one completely, so the overlap is always a contradiction in the caller's plan (a
+    // re-placement of what is already there, or a batch that overlaps itself) — never a composition.
+    // Silently opening one more lane per attempt let an agent pile seven layers of "B-roll" on one
+    // narration. Refuse with the exact conflict so the caller fixes the frames or removes the earlier
+    // clip; an explicit trackId remains the deliberate overwrite path. Boxed inserts (PiP, evidence
+    // over a background) and images keep their parallel lanes.
+    const endFrame = placement.startFrame + placement.durationFrames;
+    const overlaps = roleTracks.flatMap((track) => track.clips.flatMap((clip) => (
+      clip.kind === 'media'
+      && !clip.box
+      && document.assets[clip.assetId]?.kind === 'video'
+      && clip.startFrame < endFrame
+      && clip.startFrame + clip.durationFrames > placement.startFrame
+        ? [{ trackId: track.id, clipId: clip.id, assetId: clip.assetId, frames: [clip.startFrame, clip.startFrame + clip.durationFrames] as [number, number] }]
+        : []
+    )));
+    if (overlaps.length) {
+      const first = overlaps[0]!;
+      return fail(
+        `${asset.id} at frames ${placement.startFrame}–${endFrame} overlaps the full-frame B-roll video ${first.clipId} (frames ${first.frames[0]}–${first.frames[1]}) on ${first.trackId}${overlaps.length > 1 ? ` and ${overlaps.length - 1} more` : ''}. Full-frame B-roll videos never stack: the upper one would hide the lower one completely. Choose frames inside a free gap, remove or move the existing clip first, or pass trackId: '${first.trackId}' to overwrite that lane deliberately. Nothing was placed.`,
+        { reason: 'broll_overlap', overlaps },
+      );
+    }
+  }
   const existing = desired.role === 'primaryNarrative'
     ? roleTracks[0]
     : useFreeLane
@@ -421,15 +473,32 @@ function placementFor(document: EditorDocumentV2, asset: EditorMediaAsset, item:
   if (item.anchorY !== undefined && anchorY === undefined) return fail('anchorY must be within 0..1');
   if (item.opacity !== undefined && opacity === undefined) return fail('opacity must be within 0..1');
   if (wantsPrimary) {
+    const sourceOutSec = sec(item.sourceOutSec, sourceInSec + requestedDuration);
+    const sourceDurationSec = sourceOutSec - sourceInSec;
+    if (!(sourceDurationSec > 0)) return fail('primary video sourceOutSec must be after sourceInSec');
+    if (typeof item.speed === 'number' && Math.abs(item.speed - 1) > 1e-6) {
+      return fail('Primary clips are placed at natural speed. Remove speed and make durationSec match the selected source range; use set_video_speed only for an intentional creative retime, never to fill narration time.');
+    }
+    const naturalDurationFrames = positiveDurationFrames(sourceDurationSec, document.canvas.fps);
+    if (Number.isFinite(explicitDurationSec) && Math.abs(durationFrames - naturalDurationFrames) > 2) {
+      return fail(`Primary clip durationSec must match its ${sourceDurationSec.toFixed(3)}s source range at natural speed. Add another usable source interval or revise narration instead of stretching footage.`);
+    }
     return {
       ...common,
+      durationFrames: naturalDurationFrames,
       kind: 'narrative',
       assetId: asset.id,
       sourceInSec,
-      sourceOutSec: sec(item.sourceOutSec, sourceInSec + requestedDuration),
+      sourceOutSec,
       ...(box ? { box } : {}),
       properties: {
         treatment: 'full',
+        preciseFraming: {
+          scale: 1,
+          anchorX: anchorX ?? 0.5,
+          anchorY: anchorY ?? 0.5,
+          coordinateSpace: 'source-normalized',
+        },
         ...(typeof item.volumeDb === 'number' ? { volumeDb: item.volumeDb } : {}),
         ...(typeof item.muted === 'boolean' ? { audioMuted: item.muted } : {}),
       },
@@ -446,6 +515,9 @@ function placementFor(document: EditorDocumentV2, asset: EditorMediaAsset, item:
     ...(anchorX != null ? { anchorX } : {}),
     ...(anchorY != null ? { anchorY } : {}),
     ...(opacity != null ? { opacity } : {}),
+    // Overlay media keeps its audio settings under `video` (the shot-scoped controls); without this
+    // a `muted: true` on a broll row was silently dropped and the source sound played over narration.
+    ...(typeof item.muted === 'boolean' ? { video: { treatment: 'full', audioMuted: item.muted } } : {}),
   } as MediaTimelineClip & { offsetFrames: number };
 }
 
@@ -513,7 +585,7 @@ export function resizeVisualTimelineClip(
       : 0;
     newStartFrame = Math.max(previousEndFrame, sourceFloorFrame, Math.min(requestedFrame, oldEndFrame - minFrames));
     if (asset.kind === 'video' && sourceRate > 0) {
-      sourceInSec = Math.max(0, sourceInSec + timelineFramesToSeconds(newStartFrame - oldStartFrame, fps) * sourceRate);
+      sourceInSec = Math.max(0, sourceInSec + frameDeltaSec(newStartFrame - oldStartFrame, fps) * sourceRate);
     }
   } else {
     const sourceCeilingFrame = asset.kind === 'video' && sourceRate > 0 && asset.metadata.durationSec != null
@@ -521,7 +593,7 @@ export function resizeVisualTimelineClip(
       : Number.POSITIVE_INFINITY;
     newEndFrame = Math.min(nextStartFrame, sourceCeilingFrame, Math.max(requestedFrame, oldStartFrame + minFrames));
     if (asset.kind === 'video' && sourceRate > 0) {
-      sourceOutSec += timelineFramesToSeconds(newEndFrame - oldEndFrame, fps) * sourceRate;
+      sourceOutSec += frameDeltaSec(newEndFrame - oldEndFrame, fps) * sourceRate;
       if (asset.metadata.durationSec != null) sourceOutSec = Math.min(asset.metadata.durationSec, sourceOutSec);
     }
   }
@@ -554,6 +626,294 @@ export function resizeVisualTimelineClip(
   });
 }
 
+/** Trim/extend one primary narrative clip from its own edge. Edge extensions on a packed primary
+ * track ripple later sync-locked material so source handles can be restored without overlap. A
+ * transition attached to the changed cut is cleared because it no longer describes the boundary. */
+export function resizeNarrativeTimelineClip(
+  document: EditorDocumentV2,
+  clipId: string,
+  edge: VisualTimelineResizeEdge,
+  atSec: number,
+): AgentTimelineOutcome {
+  if (!Number.isFinite(atSec)) return fail('narrative clip resize time must be finite');
+  const found = locatedClip(document, clipId);
+  if (!found || found.clip.kind !== 'narrative' || found.track.id !== document.semantics.primaryNarrativeTrackId) {
+    return fail(`primary narrative clip not found: ${clipId}`);
+  }
+  if (found.track.locked) return fail(`track is locked: ${found.track.id}`);
+  const asset = document.assets[found.clip.assetId];
+  if (!asset || asset.kind !== 'video') return fail(`narrative video asset not found: ${found.clip.assetId}`);
+
+  const fps = document.canvas.fps;
+  const minFrames = positiveDurationFrames(0.2, fps);
+  const oldStartFrame = found.clip.startFrame;
+  const oldEndFrame = oldStartFrame + found.clip.durationFrames;
+  const siblings = found.track.clips
+    .filter((clip): clip is NarrativeTimelineClip => clip.id !== clipId && clip.kind === 'narrative')
+    .sort((left, right) => left.startFrame - right.startFrame || left.id.localeCompare(right.id));
+  const previousEndFrame = siblings
+    .filter((clip) => clip.startFrame + clip.durationFrames <= oldStartFrame)
+    .reduce((end, clip) => Math.max(end, clip.startFrame + clip.durationFrames), 0);
+  // A packed clip at timeline zero still has a usable source head. Its left-handle pointer can be
+  // negative even though the committed timeline remains non-negative, so preserve that signed delta.
+  const requestedFrame = edge === 'left' ? Math.round(atSec * fps) : secondsToTimelineFrames(Math.max(0, atSec), fps);
+  const sourceRate = (found.clip.sourceOutSec - found.clip.sourceInSec)
+    / timelineFramesToSeconds(found.clip.durationFrames, fps);
+
+  let newStartFrame = oldStartFrame;
+  let newEndFrame = oldEndFrame;
+  let sourceInSec = found.clip.sourceInSec;
+  let sourceOutSec = found.clip.sourceOutSec;
+  let rippleHeadExtension = false;
+  if (edge === 'left') {
+    const sourceFloorFrame = sourceRate > 0
+      ? oldStartFrame - secondsToTimelineFrames(sourceInSec / sourceRate, fps)
+      : oldStartFrame;
+    rippleHeadExtension = requestedFrame < oldStartFrame && previousEndFrame === oldStartFrame;
+    if (rippleHeadExtension) {
+      const requestedSourceEdgeFrame = Math.max(sourceFloorFrame, requestedFrame);
+      newEndFrame = oldEndFrame + oldStartFrame - requestedSourceEdgeFrame;
+      if (sourceRate > 0) {
+        sourceInSec = Math.max(0, sourceInSec + frameDeltaSec(requestedSourceEdgeFrame - oldStartFrame, fps) * sourceRate);
+      }
+    } else {
+      newStartFrame = Math.max(previousEndFrame, sourceFloorFrame, Math.min(requestedFrame, oldEndFrame - minFrames));
+      if (sourceRate > 0) {
+        sourceInSec = Math.max(0, sourceInSec + frameDeltaSec(newStartFrame - oldStartFrame, fps) * sourceRate);
+      }
+    }
+  } else {
+    const sourceCeilingFrame = sourceRate > 0 && asset.metadata.durationSec != null
+      ? oldEndFrame + secondsToTimelineFrames(Math.max(0, asset.metadata.durationSec - sourceOutSec) / sourceRate, fps)
+      : Number.POSITIVE_INFINITY;
+    newEndFrame = Math.min(sourceCeilingFrame, Math.max(requestedFrame, oldStartFrame + minFrames));
+    if (sourceRate > 0) {
+      sourceOutSec += frameDeltaSec(newEndFrame - oldEndFrame, fps) * sourceRate;
+      if (asset.metadata.durationSec != null) sourceOutSec = Math.min(asset.metadata.durationSec, sourceOutSec);
+    }
+  }
+  const newDurationFrames = newEndFrame - newStartFrame;
+  if (newStartFrame === oldStartFrame && newDurationFrames === found.clip.durationFrames) {
+    return mutation(document, 'Narrative clip duration unchanged', [], {
+      clipId, startSec: timelineFramesToSeconds(oldStartFrame, fps), endSec: timelineFramesToSeconds(oldEndFrame, fps),
+    });
+  }
+
+  let baseDocument = document;
+  const receipts: EditorCommandReceipt[] = [];
+  if (edge === 'right' || rippleHeadExtension) {
+    const retimed = rippleHeadExtension
+      ? retimeEditorClip(document, {
+          trackId: found.track.id,
+          clipId,
+          durationFrames: newDurationFrames,
+          ripple: true,
+          rippleFromFrame: oldStartFrame,
+        })
+      : applyEditorCommand(document, {
+          type: 'clip.retime',
+          trackId: found.track.id,
+          clipId,
+          durationFrames: newDurationFrames,
+          ripple: true,
+        });
+    if (!retimed.ok) return fail(retimed.error.message, retimed.error);
+    baseDocument = retimed.document;
+    receipts.push(retimed.receipt);
+  }
+  const baseFound = locatedClip(baseDocument, clipId);
+  if (!baseFound || baseFound.clip.kind !== 'narrative') return fail(`primary narrative clip not found after resize: ${clipId}`);
+  const resized: NarrativeTimelineClip = {
+    ...baseFound.clip,
+    startFrame: newStartFrame,
+    durationFrames: newDurationFrames,
+    sourceInSec,
+    sourceOutSec,
+    ...(edge === 'left'
+      ? { properties: (() => {
+          const { transIn: _removed, ...properties } = found.clip.properties;
+          return properties;
+        })() }
+      : {}),
+  };
+  const tracks = baseDocument.timeline.tracks.map((track) => track.id === found.track.id
+    ? {
+        ...track,
+        clips: track.clips.map((clip) => {
+          if (clip.id === clipId) return resized;
+          if (edge !== 'right' || clip.kind !== 'narrative' || clip.properties.transIn?.prevId !== clipId) return clip;
+          const { transIn: _removed, ...properties } = clip.properties;
+          return { ...clip, properties };
+        }).sort((left, right) => left.startFrame - right.startFrame || left.id.localeCompare(right.id)),
+      }
+    : track);
+  const next = { ...baseDocument, timeline: { ...baseDocument.timeline, tracks } };
+  return mutation(next, `Resized narrative clip to ${timelineFramesToSeconds(newDurationFrames, fps)}s`, receipts, {
+    clipId,
+    startSec: timelineFramesToSeconds(newStartFrame, fps),
+    endSec: timelineFramesToSeconds(newEndFrame, fps),
+    durationSec: timelineFramesToSeconds(newDurationFrames, fps),
+    sourceInSec,
+    sourceOutSec,
+  });
+}
+
+/** Slip one primary narrative clip: shift WHICH source range plays while the clip's timeline
+ * position and duration stay untouched. `sourceDeltaSec` is in SOURCE seconds (positive = later
+ * material), clamped to the asset's head (0) and tail (metadata duration when known). The span
+ * sourceOutSec−sourceInSec is preserved EXACTLY — there is no speed field, so any span drift
+ * would silently retime the clip. Cut boundaries are unchanged, so transitions stay. */
+export function slipNarrativeTimelineClip(
+  document: EditorDocumentV2,
+  clipId: string,
+  sourceDeltaSec: number,
+): AgentTimelineOutcome {
+  if (!Number.isFinite(sourceDeltaSec)) return fail('slip delta must be finite');
+  const found = locatedClip(document, clipId);
+  if (!found || found.clip.kind !== 'narrative' || found.track.id !== document.semantics.primaryNarrativeTrackId) {
+    return fail(`primary narrative clip not found: ${clipId}`);
+  }
+  if (found.track.locked) return fail(`track is locked: ${found.track.id}`);
+  const asset = document.assets[found.clip.assetId];
+  if (!asset || asset.kind !== 'video') return fail(`narrative video asset not found: ${found.clip.assetId}`);
+
+  const span = found.clip.sourceOutSec - found.clip.sourceInSec;
+  let delta = Math.max(-found.clip.sourceInSec, sourceDeltaSec);
+  if (asset.metadata.durationSec != null) {
+    delta = Math.min(delta, Math.max(0, asset.metadata.durationSec - found.clip.sourceOutSec));
+  }
+  const sourceInSec = Math.max(0, found.clip.sourceInSec + delta);
+  const sourceOutSec = sourceInSec + span;
+  if (Math.abs(sourceInSec - found.clip.sourceInSec) < 1e-6) {
+    return mutation(document, 'Clip source window unchanged', [], {
+      clipId, sourceInSec: found.clip.sourceInSec, sourceOutSec: found.clip.sourceOutSec,
+    });
+  }
+  const tracks = document.timeline.tracks.map((track) => track.id === found.track.id
+    ? {
+        ...track,
+        clips: track.clips.map((clip) => (clip.id === clipId
+          ? { ...clip, sourceInSec, sourceOutSec }
+          : clip)),
+      }
+    : track);
+  const next = { ...document, timeline: { ...document.timeline, tracks } };
+  return mutation(next, `Slipped clip source window to ${Math.round(sourceInSec * 10) / 10}s`, [], {
+    clipId,
+    sourceInSec,
+    sourceOutSec,
+  });
+}
+
+/** Bounded edit distance for id-typo detection; bails out once the distance exceeds `cap`. */
+function boundedEditDistance(left: string, right: string, cap: number): number {
+  if (Math.abs(left.length - right.length) > cap) return cap + 1;
+  let previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= left.length; i += 1) {
+    const current = [i];
+    let rowMin = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      current[j] = Math.min(previous[j]! + 1, current[j - 1]! + 1, previous[j - 1]! + cost);
+      if (current[j]! < rowMin) rowMin = current[j]!;
+    }
+    if (rowMin > cap) return cap + 1;
+    previous = current;
+  }
+  return previous[right.length]!;
+}
+
+/** A model retyping an id from memory usually lands within a few edits of the real one (an extra
+ * character, one swapped uuid group). Naming the nearest registered id turns a dead-end retry
+ * loop into a one-shot correction. */
+function closestAssetId(assets: EditorDocumentV2['assets'], requested: string): string | null {
+  const needle = requested.replace(/^local:/, '');
+  let best: string | null = null;
+  let bestDistance = 7;
+  for (const id of Object.keys(assets)) {
+    const distance = boundedEditDistance(needle, id, 6);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = id;
+    }
+  }
+  if (best) return best;
+  // A dropped uuid segment puts the retype far beyond any edit-distance cap, yet the intact
+  // prefix — at least the full first uuid group — still names the asset when it is unique.
+  let bestPrefix: string | null = null;
+  let bestLength = 0;
+  let ambiguous = false;
+  for (const id of Object.keys(assets)) {
+    let length = 0;
+    while (length < needle.length && length < id.length && needle[length] === id[length]) length += 1;
+    if (length > bestLength) {
+      bestPrefix = id;
+      bestLength = length;
+      ambiguous = false;
+    } else if (length === bestLength && bestPrefix && id !== bestPrefix) {
+      ambiguous = true;
+    }
+  }
+  return !ambiguous && bestLength >= 'local_'.length + 8 ? bestPrefix : null;
+}
+
+/** Validate a whole batch before mutating anything: every full-frame B-roll video row that would
+ * overlap an existing full-frame B-roll video, or another row of the same batch, is listed at once
+ * with the lane's free gaps — one correction instead of one error per conflict. */
+function brollBatchOverlaps(document: EditorDocumentV2, items: Input[], input: Input): AgentTimelineOutcome | null {
+  const fps = document.canvas.fps;
+  type Span = { label: string; assetId: string; start: number; end: number; clipId?: string; trackId?: string };
+  const existing: Span[] = document.timeline.tracks
+    .filter((track) => track.type === 'visual' && track.role === 'broll')
+    .flatMap((track) => track.clips.flatMap((clip) => (
+      clip.kind === 'media' && !clip.box && document.assets[clip.assetId]?.kind === 'video'
+        ? [{ label: `${clip.id} on ${track.id}`, assetId: clip.assetId, start: clip.startFrame, end: clip.startFrame + clip.durationFrames, clipId: clip.id, trackId: track.id }]
+        : []
+    )));
+  const planned: Span[] = [];
+  const conflicts: string[] = [];
+  const overlaps: Array<{ clipId: string; trackId: string; assetId: string; frames: [number, number] }> = [];
+  for (const [index, raw] of items.entries()) {
+    const item = (raw ?? {}) as Input;
+    const asset = string(item.assetId) ? document.assets[string(item.assetId)!] : undefined;
+    if (!asset || asset.kind !== 'video' || item.box !== undefined || string(item.trackId)) continue;
+    const role = string(item.role);
+    if (role === 'primary' || role === 'narration' || role === 'music' || role === 'sfx') continue;
+    const hasExplicitStart = item.startSec != null || input.atSec != null;
+    if (!hasExplicitStart) continue;
+    const sourceInSec = Math.max(0, sec(item.sourceInSec));
+    const sourceOutSec = Number(item.sourceOutSec);
+    const durationSec = Number.isFinite(Number(item.durationSec))
+      ? Number(item.durationSec)
+      : Number.isFinite(sourceOutSec) && sourceOutSec > sourceInSec
+        ? sourceOutSec - sourceInSec
+        : asset.metadata.durationSec != null ? asset.metadata.durationSec - sourceInSec : 5;
+    const start = secondsToTimelineFrames(Math.max(0, sec(item.startSec, sec(input.atSec))), fps);
+    const end = start + positiveDurationFrames(durationSec, fps);
+    const hit = [...existing, ...planned].find((span) => span.start < end && span.end > start);
+    if (hit) {
+      conflicts.push(`clips[${index}] ${asset.id} at frames ${start}–${end} overlaps ${hit.label} (frames ${hit.start}–${hit.end})`);
+      if (hit.clipId && hit.trackId) overlaps.push({ clipId: hit.clipId, trackId: hit.trackId, assetId: hit.assetId, frames: [hit.start, hit.end] });
+    }
+    planned.push({ label: `clips[${index}] (${string(item.id) ?? `clip_${asset.id}`}, ${asset.id})`, assetId: asset.id, start, end });
+  }
+  if (!conflicts.length) return null;
+  const outputEnd = document.timeline.tracks.reduce((end, track) => track.clips.reduce((inner, clip) => Math.max(inner, clip.startFrame + clip.durationFrames), end), 0);
+  const occupied = [...existing].sort((left, right) => left.start - right.start);
+  const gaps: string[] = [];
+  let cursor = 0;
+  for (const span of occupied) {
+    if (span.start > cursor) gaps.push(`${cursor}–${span.start}`);
+    cursor = Math.max(cursor, span.end);
+  }
+  if (outputEnd > cursor) gaps.push(`${cursor}–${outputEnd}`);
+  const lane = overlaps[0]?.trackId ?? 'track_broll';
+  return fail(
+    `Nothing was placed: ${conflicts.length} full-frame B-roll overlap${conflicts.length === 1 ? '' : 's'} in this batch. ${conflicts.join('; ')}. Full-frame B-roll never stacks. Free B-roll frames right now: ${gaps.length ? gaps.join(', ') : 'none'}. Fix every row and send the batch again, remove or move the existing clip first, or pass trackId: '${lane}' on a row to overwrite that lane deliberately.`,
+    { reason: 'broll_overlap', overlaps, conflicts, freeGaps: gaps },
+  );
+}
+
 function placeClips(document: EditorDocumentV2, input: Input, mode: 'overwrite' | 'ripple'): AgentTimelineOutcome {
   document = normalizePeerNarrativeSources(document);
   const items = Array.isArray(input.clips) ? input.clips : [];
@@ -563,6 +923,10 @@ function placeClips(document: EditorDocumentV2, input: Input, mode: 'overwrite' 
     return document.assets[clip.assetId]?.kind === 'video';
   }));
   const used = new Set(document.timeline.tracks.flatMap((track) => track.clips.map((clip) => clip.id)));
+  if (mode === 'overwrite') {
+    const conflicts = brollBatchOverlaps(document, items as Input[], input);
+    if (conflicts) return conflicts;
+  }
   let next = document;
   const receipts: EditorCommandReceipt[] = [];
   const created: string[] = [];
@@ -570,10 +934,31 @@ function placeClips(document: EditorDocumentV2, input: Input, mode: 'overwrite' 
     const item = (raw ?? {}) as Input;
     const assetId = string(item.assetId);
     const asset = assetId ? next.assets[assetId] : undefined;
-    if (!asset) return fail(`clips[${index}] asset not found: ${assetId ?? ''}`);
+    if (!asset) {
+      const suggestion = assetId ? closestAssetId(next.assets, assetId) : null;
+      return fail(`clips[${index}] asset not found: ${assetId ?? ''}.${suggestion ? ` Closest registered id: ${suggestion}.` : ''} Copy ids exactly from receipts; never retype them.`);
+    }
     const placement = placementFor(next, asset, item, used);
     if ('ok' in placement) return placement;
-    const atFrame = secondsToTimelineFrames(Math.max(0, sec(item.startSec, sec(input.atSec))), next.canvas.fps);
+    // No explicit start = append after the destination lane's current content (including clips
+    // placed earlier in this batch). Defaulting to 0 made every unanchored clip overwrite its
+    // predecessors at the head of the track, shredding a batched montage into fragments.
+    const hasExplicitStart = item.startSec != null || input.atSec != null;
+    let atFrame: number;
+    if (hasExplicitStart) {
+      atFrame = secondsToTimelineFrames(Math.max(0, sec(item.startSec, sec(input.atSec))), next.canvas.fps);
+    } else {
+      const requestedTrack = string(item.trackId)
+        ? next.timeline.tracks.find((track) => track.id === string(item.trackId))
+        : undefined;
+      const desired = expectedTrack(asset, string(item.role));
+      const laneTracks = requestedTrack
+        ? [requestedTrack]
+        : next.timeline.tracks.filter((track) => track.type === desired.type && track.role === desired.role);
+      atFrame = laneTracks
+        .flatMap((track) => track.clips.map((clip) => clip.startFrame + clip.durationFrames))
+        .reduce((latest, end) => Math.max(latest, end), 0);
+    }
     const ensured = ensureTrack(
       next,
       asset,
@@ -707,11 +1092,19 @@ function removeClips(document: EditorDocumentV2, input: Input): AgentTimelineOut
   let next = document;
   const receipts: EditorCommandReceipt[] = [];
   const byTrack = new Map<string, string[]>();
+  // Ids that no longer exist are skipped, not fatal: an agent correcting its own work often
+  // re-lists a clip it already removed, and failing the whole batch on that stale id left the
+  // rest in place (and the agent retrying the identical call). The receipt names the misses.
+  const missingClipIds: string[] = [];
   for (const id of clipIds) {
     const found = locatedClip(next, id);
-    if (!found) return fail(`clip not found: ${id}`);
+    if (!found) {
+      missingClipIds.push(id);
+      continue;
+    }
     byTrack.set(found.track.id, [...(byTrack.get(found.track.id) ?? []), id]);
   }
+  if (!byTrack.size) return fail(`clip not found: ${missingClipIds.join(', ')}`);
   for (const [trackId, ids] of byTrack) {
     // An earlier group may already remove linked partners on this track. Re-resolve against the
     // current document so a cross-track linked batch stays idempotent within this transaction.
@@ -722,7 +1115,14 @@ function removeClips(document: EditorDocumentV2, input: Input): AgentTimelineOut
     next = removed.document;
     receipts.push(removed.receipt);
   }
-  return mutation(next, `Removed ${clipIds.length} clip${clipIds.length === 1 ? '' : 's'}`, receipts);
+  // remove means remove — no editorial-judgment guard here. Protecting an assembled cut from
+  // agent self-demolition is the per-turn harness lock's job (it knows intent and turn state);
+  // an engine-level veto also blocked legitimate clears from the UI, MCP agents and other flows,
+  // and removals stay recoverable through undo.
+  const removedCount = clipIds.length - missingClipIds.length;
+  const summary = `Removed ${removedCount} clip${removedCount === 1 ? '' : 's'}`
+    + (missingClipIds.length ? ` (${missingClipIds.length} already gone: ${missingClipIds.join(', ')})` : '');
+  return mutation(next, summary, receipts, missingClipIds.length ? { removedClipIds: clipIds.filter((id) => !missingClipIds.includes(id)), missingClipIds } : undefined);
 }
 
 function splitClips(document: EditorDocumentV2, input: Input): AgentTimelineOutcome {
@@ -806,6 +1206,7 @@ function setClipProperties(document: EditorDocumentV2, input: Input): AgentTimel
   let next = document;
   const receipts: EditorCommandReceipt[] = [];
   const unchangedPrimaryFillClipIds: string[] = [];
+  let visualSourceChanged = false;
   for (const [index, raw] of items.entries()) {
     const item = (raw ?? {}) as Input;
     const clipId = string(item.clipId);
@@ -819,8 +1220,45 @@ function setClipProperties(document: EditorDocumentV2, input: Input): AgentTimel
       found = locatedClip(next, clipId!);
     }
     if (!found) return fail(`items[${index}] clip not found after move`);
+    const visualAsset = (found.clip.kind === 'media' || found.clip.kind === 'narrative')
+      ? next.assets[found.clip.assetId]
+      : undefined;
+    const patchesVisualSource = typeof item.sourceInSec === 'number' || typeof item.sourceOutSec === 'number';
+    if (patchesVisualSource && visualAsset?.kind === 'video' && (found.clip.kind === 'media' || found.clip.kind === 'narrative')) {
+      const sourceInSec = typeof item.sourceInSec === 'number' ? item.sourceInSec : found.clip.sourceInSec;
+      const sourceOutSec = typeof item.sourceOutSec === 'number' ? item.sourceOutSec : found.clip.sourceOutSec;
+      if (!Number.isFinite(sourceInSec) || !Number.isFinite(sourceOutSec) || sourceInSec < 0 || sourceOutSec <= sourceInSec || (visualAsset.metadata.durationSec != null && sourceOutSec > visualAsset.metadata.durationSec + 0.001)) {
+        return fail(`items[${index}] video source range must be positive, ordered, and inside the asset duration`);
+      }
+      const oldSourceDurationSec = found.clip.sourceOutSec - found.clip.sourceInSec;
+      const oldTimelineDurationSec = timelineFramesToSeconds(found.clip.durationFrames, next.canvas.fps);
+      const playbackSpeed = oldTimelineDurationSec > 0 ? oldSourceDurationSec / oldTimelineDurationSec : 1;
+      const newDurationFrames = positiveDurationFrames((sourceOutSec - sourceInSec) / Math.max(0.01, playbackSpeed), next.canvas.fps);
+      if (newDurationFrames !== found.clip.durationFrames) {
+        const retimed = applyEditorCommand(next, {
+          type: 'clip.retime',
+          trackId: found.track.id,
+          clipId: found.clip.id,
+          durationFrames: newDurationFrames,
+          ripple: found.clip.kind === 'narrative',
+        });
+        if (!retimed.ok) return fail(retimed.error.message, retimed.error);
+        next = retimed.document;
+        receipts.push(retimed.receipt);
+        found = locatedClip(next, clipId!);
+        if (!found) return fail(`items[${index}] clip not found after source-range retime`);
+      }
+      visualSourceChanged = true;
+    } else if (patchesVisualSource && found.clip.kind !== 'audio') {
+      return fail(`items[${index}] sourceInSec/sourceOutSec require a video or audio clip`);
+    }
+    if (typeof item.speed === 'number' && visualAsset?.kind === 'video') {
+      return fail(`items[${index}] use set_video_speed for video speed changes`);
+    }
     const commonPatch: ClipPatch = {
       ...(typeof item.enabled === 'boolean' ? { enabled: item.enabled } : {}),
+      ...(patchesVisualSource && visualAsset?.kind === 'video' && typeof item.sourceInSec === 'number' ? { sourceInSec: item.sourceInSec } : {}),
+      ...(patchesVisualSource && visualAsset?.kind === 'video' && typeof item.sourceOutSec === 'number' ? { sourceOutSec: item.sourceOutSec } : {}),
     };
     if (item.fit === 'contain' || item.fit === 'cover') {
       if (found.clip.kind === 'narrative') {
@@ -877,6 +1315,12 @@ function setClipProperties(document: EditorDocumentV2, input: Input): AgentTimel
         receipts.push(...edited.receipts);
       }
     }
+  }
+  if (visualSourceChanged && next.semantics.managedCaptionTrackId) {
+    const relayed = applyEditorCommand(next, { type: 'captions.relay' });
+    if (!relayed.ok) return fail(relayed.error.message, relayed.error);
+    next = relayed.document;
+    receipts.push(relayed.receipt);
   }
   const changedCount = receipts.filter((receipt) => receipt.affectedTrackIds.length > 0).length;
   const summary = changedCount === 0 && unchangedPrimaryFillClipIds.length
@@ -1123,27 +1567,109 @@ function swapClipMedia(document: EditorDocumentV2, input: Input): AgentTimelineO
   return mutation(result.document, `Swapped media on clip ${clipId}`, [result.receipt], { clipId, assetId });
 }
 
+/** Deterministic overlay-text layout guard. Two collisions kept recurring in delivered edits:
+ * a title placed into the caption band (both stacked at the bottom), and two titles visible at
+ * the same time on intersecting boxes. Both are geometry facts the engine can resolve — captions
+ * own their bottom band whenever they are on, and a later title is lifted above a concurrent
+ * peer. Model-authored placement stays authoritative everywhere these rules are not violated. */
+const OVERLAY_TEXT_SAFE_TOP = 0.06;
+const CAPTION_BAND_HEIGHT_FRAC = 0.14;
+const OVERLAY_TEXT_GAP = 0.02;
+function overlayTextLayoutGuard(
+  document: EditorDocumentV2,
+  requested: { x: number; y: number; w: number; h: number },
+  startSec: number,
+  durationSec: number,
+): { x: number; y: number; w: number; h: number } {
+  const box = { ...requested };
+  const caption = document.appearance.captionStyle;
+  if (caption?.on) {
+    // captionStyle.yPct = caption bottom edge from canvas top (%); reserve up to two lines above.
+    const captionBottom = Math.min(1, Math.max(0, (caption.yPct ?? 88) / 100));
+    const bandTop = captionBottom - CAPTION_BAND_HEIGHT_FRAC;
+    if (box.y + box.h > bandTop - OVERLAY_TEXT_GAP && box.y < captionBottom + OVERLAY_TEXT_GAP) {
+      box.y = Math.max(OVERLAY_TEXT_SAFE_TOP, bandTop - OVERLAY_TEXT_GAP - box.h);
+    }
+  }
+  const windowEnd = startSec + durationSec;
+  const peers = document.timeline.tracks.flatMap((track) => track.clips.flatMap((clip) => {
+    if (clip.kind !== 'graphic' || clip.block.templateId !== 'title' || !clip.block.box) return [];
+    const clipStart = timelineFramesToSeconds(clip.startFrame, document.canvas.fps);
+    const clipEnd = clipStart + timelineFramesToSeconds(clip.durationFrames, document.canvas.fps);
+    return clipEnd > startSec && clipStart < windowEnd ? [clip.block.box] : [];
+  }));
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const hit = peers.find((peer) => (
+      box.x < peer.x + peer.w && box.x + box.w > peer.x
+      && box.y < peer.y + peer.h && box.y + box.h > peer.y
+    ));
+    if (!hit) break;
+    const lifted = Math.max(OVERLAY_TEXT_SAFE_TOP, hit.y - OVERLAY_TEXT_GAP - box.h);
+    if (lifted === box.y) break; // crowded against the top: keep the residual rather than thrash
+    box.y = lifted;
+  }
+  return box;
+}
+
 function addTexts(document: EditorDocumentV2, input: Input): AgentTimelineOutcome {
   const items = Array.isArray(input.items) ? input.items : [];
   if (!items.length) return fail('items is required');
   let next = document;
   const receipts: EditorCommandReceipt[] = [];
   const clipIds: string[] = [];
+  const skippedDuplicates: string[] = [];
   const used = new Set(next.timeline.tracks.flatMap((track) => track.clips.map((clip) => clip.id)));
   for (const [index, raw] of items.entries()) {
     const item = (raw ?? {}) as Input;
     const text = string(item.text);
     if (!text) return fail(`items[${index}] text is required`);
+    const preset = isDisplayTextPresetId(item.preset) ? item.preset : 'clean';
+    const animation = isDisplayTextAnimationId(item.animation) ? item.animation : undefined;
+    const fontFamily = isDisplayTextFontId(item.fontFamily) ? item.fontFamily : undefined;
+    const align = item.align === 'left' || item.align === 'right' || item.align === 'center' ? item.align : undefined;
+    const placement = placementPercentToBox(item.placement, next.canvas.width, next.canvas.height);
+    if (placement.error) return fail(`items[${index}] ${placement.error}`);
+    const startSec = Math.max(0, sec(item.startSec));
+    const durationSec = Math.max(0.2, sec(item.durationSec, 3));
+    // Duplicate protection: a second styling pass once re-ADDED an existing line instead of
+    // updating it, stacking two copies of the same words on screen. Identical text overlapping
+    // the same time window is an update target, never a second copy.
+    const itemEndSec = startSec + durationSec;
+    const duplicate = next.timeline.tracks.some((track) => track.clips.some((clip) => {
+      if (clip.kind !== 'graphic' || clip.block.templateId !== 'title') return false;
+      const clipStart = timelineFramesToSeconds(clip.startFrame, next.canvas.fps);
+      const clipEnd = clipStart + timelineFramesToSeconds(clip.durationFrames, next.canvas.fps);
+      const clipText = typeof clip.block.slots?.text === 'string' ? clip.block.slots.text.trim() : '';
+      return clipText === text && clipEnd > startSec && clipStart < itemEndSec;
+    }));
+    if (duplicate) {
+      skippedDuplicates.push(text.slice(0, 24));
+      continue;
+    }
     const block = titleBlock({
       text,
-      startSec: Math.max(0, sec(item.startSec)),
-      durationSec: Math.max(0.2, sec(item.durationSec, 3)),
-      ...(typeof item.trackIndex === 'number' ? { trackIndex: Math.round(item.trackIndex) } : {}),
-      ...(string(item.sub) ? { sub: string(item.sub) } : {}),
+      startSec,
+      durationSec,
+      trackIndex: typeof item.trackIndex === 'number'
+        ? Math.round(item.trackIndex)
+        : freeGraphicsStackOrder(next, startSec, durationSec),
+      preset,
+      ...(animation ? { animation } : {}),
+      ...(string(item.color) ? { color: string(item.color) } : {}),
+      ...(string(item.accentColor) ? { accentColor: string(item.accentColor) } : {}),
+      ...(typeof item.fontSize === 'number' ? { fontSize: item.fontSize } : {}),
+      ...(typeof item.fontWeight === 'number' ? { fontWeight: item.fontWeight } : {}),
+      ...(fontFamily ? { fontFamily } : {}),
+      ...(align ? { align } : {}),
     });
     // Agent-created native text must remain positionable. Manual/legacy titleBlock callers retain
     // their established full-canvas behaviour; this tool supplies the editable safe-area geometry.
-    block.box = { x: 0.1, y: 0.34, w: 0.8, h: 0.32 };
+    block.box = overlayTextLayoutGuard(
+      next,
+      placement.box ?? { x: 0.1, y: 0.34, w: 0.8, h: 0.32 },
+      startSec,
+      durationSec,
+    );
     block.id = uniqueId(string(item.id) ?? block.id, used);
     used.add(block.id);
     const inserted = insertOverlayDocumentClip({
@@ -1157,7 +1683,18 @@ function addTexts(document: EditorDocumentV2, input: Input): AgentTimelineOutcom
     receipts.push(...inserted.receipts);
     clipIds.push(block.id);
   }
-  return mutation(next, `Added ${clipIds.length} text clip${clipIds.length === 1 ? '' : 's'}`, receipts, { clipIds });
+  return mutation(
+    next,
+    `Added ${clipIds.length} text clip${clipIds.length === 1 ? '' : 's'}${skippedDuplicates.length ? `; skipped ${skippedDuplicates.length} duplicate${skippedDuplicates.length === 1 ? '' : 's'}` : ''}`,
+    receipts,
+    {
+      clipIds,
+      ...(skippedDuplicates.length ? {
+        skippedDuplicates,
+        instruction: 'Identical on-screen text already exists in that time window. Use update_texts to restyle or move the existing clip instead of adding a copy.',
+      } : {}),
+    },
+  );
 }
 
 function updateTexts(document: EditorDocumentV2, input: Input): AgentTimelineOutcome {
@@ -1170,14 +1707,38 @@ function updateTexts(document: EditorDocumentV2, input: Input): AgentTimelineOut
     const found = clipId ? locatedClip(document, clipId) : undefined;
     if (!found || found.clip.kind !== 'graphic' || found.clip.block.templateId !== 'title') return fail(`items[${index}] is not a title text clip`);
     const text = typeof item.text === 'string' ? item.text.trim() : undefined;
-    const sub = typeof item.sub === 'string' ? item.sub.trim() : undefined;
+    const preset = isDisplayTextPresetId(item.preset) ? item.preset : undefined;
+    const animation = isDisplayTextAnimationId(item.animation) ? item.animation : undefined;
+    const fontFamily = isDisplayTextFontId(item.fontFamily) ? item.fontFamily : undefined;
+    const align = item.align === 'left' || item.align === 'right' || item.align === 'center' ? item.align : undefined;
+    const color = typeof item.color === 'string' ? item.color.trim() : undefined;
+    const accentColor = typeof item.accentColor === 'string' ? item.accentColor.trim() : undefined;
+    const fontSize = typeof item.fontSize === 'number' ? item.fontSize : undefined;
+    const fontWeight = typeof item.fontWeight === 'number' ? item.fontWeight : undefined;
+    const visualChanged = preset !== undefined || animation !== undefined || align !== undefined
+      || color !== undefined || accentColor !== undefined || fontSize !== undefined
+      || fontWeight !== undefined || fontFamily !== undefined;
+    const placement = placementPercentToBox(item.placement, document.canvas.width, document.canvas.height);
+    if (placement.error) return fail(`items[${index}] ${placement.error}`);
     updates.push({
       clipId: found.clip.id,
       ...(typeof item.startSec === 'number' ? { startSec: Math.max(0, item.startSec) } : {}),
       ...(typeof item.durationSec === 'number' ? { durationSec: Math.max(0.2, item.durationSec) } : {}),
-      ...((text !== undefined || sub !== undefined) ? { block: {
-        slots: { ...found.clip.block.slots, ...(text !== undefined ? { text } : {}), ...(sub !== undefined ? { sub } : {}) },
+      ...((text !== undefined || visualChanged || placement.box) ? { block: {
+        slots: {
+          ...found.clip.block.slots,
+          ...(text !== undefined ? { text } : {}),
+          ...(preset !== undefined ? { preset } : {}),
+          ...(animation !== undefined ? { animation } : {}),
+          ...(align !== undefined ? { align } : {}),
+          ...(color !== undefined ? { color } : {}),
+          ...(accentColor !== undefined ? { accentColor } : {}),
+          ...(fontSize !== undefined ? { fontSize } : {}),
+          ...(fontWeight !== undefined ? { fontWeight } : {}),
+          ...(fontFamily !== undefined ? { fontFamily } : {}),
+        },
         ...(text !== undefined ? { label: text } : {}),
+        ...(placement.box ? { box: placement.box } : {}),
       } } : {}),
     });
   }

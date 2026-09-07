@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { applyCaptionDocumentEdit } from './caption-document-edit';
+import { audioClipDefaults } from './audio-tracks';
 import { emptyEditorDocumentV2, parseEditorDocumentV2, projectV2ToLegacyComposition } from './editor-document';
-import { resizeVisualTimelineClip, runAgentTimelineTool } from './agent-timeline';
+import { resizeNarrativeTimelineClip, resizeVisualTimelineClip, runAgentTimelineTool, slipNarrativeTimelineClip } from './agent-timeline';
 import { withDirectorPlanInSemantics } from './director-plan-artifact';
 import { withSceneDesignsInSemantics } from './scene-design';
 
@@ -81,6 +82,10 @@ describe('shared agent timeline atoms', () => {
     expect(placed.ok).toBe(true);
     const narration = placed.document!.timeline.tracks.find((track) => track.role === 'narration')!;
     expect(narration).toMatchObject({ type: 'audio', clips: [{ kind: 'audio', assetId: 'tts-1', properties: { volumeDb: 4 } }] });
+    const projectedNarration = projectV2ToLegacyComposition(placed.document!).audioTracks?.[0];
+    expect(projectedNarration).toMatchObject({ role: 'narration' });
+    expect(audioClipDefaults(projectedNarration!).fadeInSec).toBe(0);
+    expect(audioClipDefaults(projectedNarration!).fadeOutSec).toBe(0);
     const captions = applyCaptionDocumentEdit({
       document: placed.document!, patch: { on: true, preset: 'ln-clean' }, source: { mode: 'track', trackId: narration.id }, mainTranscript: null, clipTranscripts: {},
     });
@@ -151,6 +156,86 @@ describe('shared agent timeline atoms', () => {
     expect((placed.data as { overwrittenClipIds?: string[] }).overwrittenClipIds).toBeUndefined();
   });
 
+  it('skips a duplicate title with the same text in an overlapping time window', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    const first = runAgentTimelineTool(document, 'add_texts', { items: [{
+      id: 'line-1', text: '普通的人生，依然值得被爱', startSec: 50, durationSec: 4,
+      placement: { xPct: 10, yPct: 40, widthPct: 80, heightPct: 16 },
+    }] });
+    expect(first.ok).toBe(true);
+    const second = runAgentTimelineTool(first.document!, 'add_texts', { items: [{
+      id: 'line-copy', text: '普通的人生，依然值得被爱', startSec: 50.2, durationSec: 3.9,
+      placement: { xPct: 8, yPct: 26, widthPct: 84, heightPct: 14 },
+    }] });
+    expect(second.ok).toBe(true);
+    expect((second.data as { skippedDuplicates?: string[] }).skippedDuplicates).toHaveLength(1);
+    const titles = second.document!.timeline.tracks.flatMap((track) => track.clips)
+      .filter((clip) => clip.kind === 'graphic');
+    expect(titles).toHaveLength(1);
+    // Same text at a NON-overlapping time (a deliberate structural echo) still lands.
+    const echo = runAgentTimelineTool(second.document!, 'add_texts', { items: [{
+      id: 'line-echo', text: '普通的人生，依然值得被爱', startSec: 90, durationSec: 3,
+    }] });
+    expect(echo.ok).toBe(true);
+    expect((echo.data as { clipIds: string[] }).clipIds).toEqual(['line-echo']);
+  });
+
+  it('keeps overlay text out of the caption band and off concurrent titles', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = { ...document, appearance: { ...document.appearance, captionStyle: { on: true, preset: 'ln-clean', yPct: 84 } } };
+    const first = runAgentTimelineTool(document, 'add_texts', { items: [{
+      id: 'title-low', text: 'bottom line', startSec: 10, durationSec: 5,
+      placement: { xPct: 10, yPct: 66, widthPct: 70, heightPct: 20 },
+    }] });
+    expect(first.ok).toBe(true);
+    const lowBox = first.document!.timeline.tracks.flatMap((track) => track.clips)
+      .find((clip) => clip.id === 'title-low')!;
+    const lowRect = (lowBox as { block: { box: { y: number; h: number } } }).block.box;
+    // Requested bottom edge 86% sat inside the caption band (bottom 84%); lifted above it.
+    expect(lowRect.y + lowRect.h).toBeLessThanOrEqual(0.84 - 0.14);
+
+    const second = runAgentTimelineTool(first.document!, 'add_texts', { items: [{
+      id: 'title-peer', text: 'concurrent', startSec: 12, durationSec: 5,
+      placement: { xPct: 10, yPct: Math.round(lowRect.y * 100), widthPct: 70, heightPct: 16 },
+    }] });
+    expect(second.ok).toBe(true);
+    const peerRect = (second.document!.timeline.tracks.flatMap((track) => track.clips)
+      .find((clip) => clip.id === 'title-peer') as { block: { box: { y: number; h: number } } }).block.box;
+    // Same time window + intersecting box: the later title stacks above the earlier one.
+    expect(peerRect.y + peerRect.h).toBeLessThanOrEqual(lowRect.y);
+
+    const later = runAgentTimelineTool(second.document!, 'add_texts', { items: [{
+      id: 'title-later', text: 'different moment', startSec: 30, durationSec: 4,
+      placement: { xPct: 10, yPct: Math.round(lowRect.y * 100), widthPct: 70, heightPct: 16 },
+    }] });
+    expect(later.ok).toBe(true);
+    const laterRect = (later.document!.timeline.tracks.flatMap((track) => track.clips)
+      .find((clip) => clip.id === 'title-later') as { block: { box: { y: number } } }).block.box;
+    // No temporal overlap: the requested placement stands.
+    expect(Math.round(laterRect.y * 100)).toBe(Math.round(lowRect.y * 100));
+  });
+
+  it('appends unanchored batch clips sequentially instead of stacking them at the track head', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', { assets: [
+      { id: 'voice', kind: 'audio', url: 'https://cdn.example/voice.mp3', durationSec: 12 },
+      { id: 'vid-a', kind: 'video', url: 'https://cdn.example/a.mp4', durationSec: 20 },
+      { id: 'vid-b', kind: 'video', url: 'https://cdn.example/b.mp4', durationSec: 20 },
+      { id: 'vid-c', kind: 'video', url: 'https://cdn.example/c.mp4', durationSec: 20 },
+    ] }).document!;
+    const placed = runAgentTimelineTool(document, 'add_clips', { clips: [
+      { assetId: 'voice', role: 'narration', startSec: 0, durationSec: 12 },
+      { id: 'shot-a', assetId: 'vid-a', role: 'primary', muted: true, sourceInSec: 1, sourceOutSec: 4 },
+      { id: 'shot-b', assetId: 'vid-b', role: 'primary', muted: true, sourceInSec: 0, sourceOutSec: 5 },
+      { id: 'shot-c', assetId: 'vid-c', role: 'primary', muted: true, sourceInSec: 2, sourceOutSec: 6 },
+    ] });
+    expect(placed.ok, JSON.stringify(placed)).toBe(true);
+    const primary = placed.document!.timeline.tracks.find((track) => track.role === 'primaryNarrative')!;
+    expect(primary.clips.map((clip) => clip.id)).toEqual(['shot-a', 'shot-b', 'shot-c']);
+    expect(primary.clips.map((clip) => clip.startFrame)).toEqual([0, 90, 240]);
+    expect(primary.clips.reduce((sum, clip) => sum + clip.durationFrames, 0)).toBe(360);
+  });
+
   it('inherits probed dimensions when an alias registers the same local source', () => {
     let document = emptyEditorDocumentV2({ fps: 30 });
     document = runAgentTimelineTool(document, 'register_media', { assets: [{
@@ -169,8 +254,46 @@ describe('shared agent timeline atoms', () => {
     expect(added.ok).toBe(true);
     expect(added.document!.timeline.tracks.flatMap((track) => track.clips).find((clip) => clip.id === 'title-1')).toMatchObject({
       kind: 'graphic',
-      block: { box: { x: 0.1, y: 0.34, w: 0.8, h: 0.32 } },
+      block: { box: { x: 0.1, y: 0.34, w: 0.8, h: 0.32 }, slots: { preset: 'clean' } },
     });
+  });
+
+  it('persists native display-text preset, animation, style and planned placement', () => {
+    const added = runAgentTimelineTool(emptyEditorDocumentV2({ fps: 30, width: 1080, height: 1920 }), 'add_texts', {
+      items: [{
+        id: 'hook', text: '仍然相信理想', startSec: 1, durationSec: 2.5,
+        preset: 'editorial', animation: 'wordReveal', color: '#F7F1E8', accentColor: '#D8A84E',
+        fontSize: 84, fontWeight: 650, fontFamily: 'serif', align: 'left',
+        placement: { xPct: 10, yPct: 18, widthPct: 76, heightPct: 22 },
+      }],
+    });
+    expect(added.ok).toBe(true);
+    const clip = added.document!.timeline.tracks.flatMap((track) => track.clips).find((candidate) => candidate.id === 'hook');
+    expect(clip).toMatchObject({
+      kind: 'graphic',
+      block: {
+        box: { x: 0.1, y: 0.18, w: 0.76, h: 0.22 },
+        slots: {
+          preset: 'editorial', animation: 'wordReveal', color: '#F7F1E8', accentColor: '#D8A84E',
+          fontSize: 84, fontWeight: 650, fontFamily: 'serif', align: 'left',
+        },
+      },
+    });
+  });
+
+  it('reuses one graphics lane for sequential display text and allocates another only for overlap', () => {
+    const added = runAgentTimelineTool(emptyEditorDocumentV2({ fps: 30 }), 'add_texts', {
+      items: [
+        { id: 'a', text: 'A', startSec: 0, durationSec: 1 },
+        { id: 'b', text: 'B', startSec: 1, durationSec: 1 },
+        { id: 'overlap', text: 'C', startSec: 1.5, durationSec: 1 },
+      ],
+    });
+    expect(added.ok).toBe(true);
+    const graphics = added.document!.timeline.tracks.filter((track) => track.type === 'graphics');
+    expect(graphics).toHaveLength(2);
+    expect(graphics.find((track) => track.stackOrder === 2)?.clips.map((clip) => clip.id)).toEqual(['a', 'b']);
+    expect(graphics.find((track) => track.stackOrder === 3)?.clips.map((clip) => clip.id)).toEqual(['overlap']);
   });
 
   it('uses a generated speech estimate as the initial asset and clip duration', () => {
@@ -188,6 +311,28 @@ describe('shared agent timeline atoms', () => {
     const narration = placed.document!.timeline.tracks.find((track) => track.role === 'narration')!;
     expect(narration.clips[0]!.durationFrames).toBe(1_383);
     expect(narration.clips[0]).toMatchObject({ sourceInSec: 0, sourceOutSec: 46.1 });
+  });
+
+  it('stores muted on overlay (broll) media clips as the shot-scoped audio mute', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [
+        { id: 'local:quiet', kind: 'video', localSig: 'quiet.mp4:100:1', durationSec: 5 },
+        { id: 'local:loud', kind: 'video', localSig: 'loud.mp4:200:2', durationSec: 5 },
+      ],
+    }).document!;
+    const placed = runAgentTimelineTool(document, 'add_clips', {
+      clips: [
+        { id: 'quiet-clip', role: 'broll', assetId: 'local:quiet', startSec: 1, muted: true },
+        { id: 'loud-clip', role: 'broll', assetId: 'local:loud', startSec: 8 },
+      ],
+    });
+    expect(placed.ok).toBe(true);
+    const broll = placed.document!.timeline.tracks.find((track) => track.role === 'broll')!;
+    const quiet = broll.clips.find((clip) => clip.id === 'quiet-clip') as { video?: { audioMuted?: boolean } };
+    const loud = broll.clips.find((clip) => clip.id === 'loud-clip') as { video?: { audioMuted?: boolean } };
+    expect(quiet.video?.audioMuted).toBe(true);
+    expect(loud.video?.audioMuted).toBeUndefined();
   });
 
   it('keeps an overwrite destination track alive when a later clip fully replaces its contents', () => {
@@ -331,6 +476,60 @@ describe('shared agent timeline atoms', () => {
     expect(evidence.data).not.toHaveProperty('overwrittenClipIds');
   });
 
+  it('refuses a full-frame B-roll video over another full-frame B-roll video and names the conflict', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [
+        { id: 'news', kind: 'video', url: 'https://cdn.example/news.mp4', durationSec: 30 },
+        { id: 'peach', kind: 'video', url: 'https://cdn.example/peach.mp4', durationSec: 30 },
+        { id: 'logo', kind: 'image', url: 'https://cdn.example/logo.png' },
+      ],
+    }).document!;
+    const first = runAgentTimelineTool(document, 'add_clips', {
+      clips: [{ id: 'news-clip', assetId: 'news', startSec: 4.8, sourceInSec: 9.6, sourceOutSec: 12.1 }],
+    });
+    expect(first.ok).toBe(true);
+
+    // A re-placement of the same span (the classic "place it again" loop) is refused, nothing changes.
+    const again = runAgentTimelineTool(first.document!, 'add_clips', {
+      clips: [{ assetId: 'news', startSec: 4.8, sourceInSec: 9.6, sourceOutSec: 12.1 }],
+    });
+    expect(again.ok).toBe(false);
+    expect(again.error).toContain('news-clip');
+    expect(again.error).toContain("trackId: 'track_broll'");
+    expect(again.data).toMatchObject({ reason: 'broll_overlap', overlaps: [{ clipId: 'news-clip', trackId: 'track_broll', frames: [144, 219] }] });
+    expect(again.document).toBeUndefined();
+
+    // A batch that overlaps itself fails on the offending row instead of opening a second lane.
+    const selfOverlap = runAgentTimelineTool(first.document!, 'add_clips', {
+      clips: [
+        { assetId: 'peach', startSec: 26.5, sourceInSec: 2, sourceOutSec: 4.7 },
+        { assetId: 'news', startSec: 28.1, sourceInSec: 1.5, sourceOutSec: 3.5 },
+      ],
+    });
+    expect(selfOverlap.ok).toBe(false);
+    expect(selfOverlap.error).toContain('clip_peach');
+
+    // Boxed inserts and images keep their parallel lane over the B-roll.
+    const boxed = runAgentTimelineTool(first.document!, 'add_clips', {
+      clips: [
+        { assetId: 'peach', startSec: 5, durationSec: 2, box: { x: 0.6, y: 0.6, w: 0.35, h: 0.35 } },
+        { assetId: 'logo', startSec: 5, durationSec: 2 },
+      ],
+    });
+    expect(boxed.ok).toBe(true);
+    // Each parallel insert lands on its own free lane (pre-existing behaviour); the full-frame clip stays.
+    expect(boxed.document!.timeline.tracks.filter((track) => track.role === 'broll')).toHaveLength(3);
+    expect(boxed.document!.timeline.tracks[1]!.clips.map((clip) => clip.id)).toEqual(['news-clip']);
+
+    // An explicit trackId is still the deliberate overwrite path.
+    const overwrite = runAgentTimelineTool(first.document!, 'add_clips', {
+      clips: [{ assetId: 'peach', trackId: 'track_broll', startSec: 4.8, sourceInSec: 2, sourceOutSec: 4.5 }],
+    });
+    expect(overwrite.ok).toBe(true);
+    expect(overwrite.data).toMatchObject({ overwrittenClipIds: ['news-clip'] });
+  });
+
   it('uses the real source duration for contiguous repeated video coverage', () => {
     let document = emptyEditorDocumentV2({ fps: 30 });
     document = runAgentTimelineTool(document, 'register_media', {
@@ -390,6 +589,110 @@ describe('shared agent timeline atoms', () => {
       sourceInSec: 0,
       sourceOutSec: 5,
     });
+  });
+
+  it('extends a primary clip by rippling later clips and clears the changed cut transition', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [
+        { id: 'first-video', kind: 'video', url: 'https://cdn.example/first.mp4', durationSec: 20 },
+        { id: 'second-video', kind: 'video', url: 'https://cdn.example/second.mp4', durationSec: 20 },
+      ],
+    }).document!;
+    document = runAgentTimelineTool(document, 'add_clips', {
+      clips: [
+        { id: 'first', role: 'primary', assetId: 'first-video', startSec: 0, durationSec: 5 },
+        { id: 'second', role: 'primary', assetId: 'second-video', startSec: 5, durationSec: 5 },
+      ],
+    }).document!;
+    const primary = document.timeline.tracks.find((track) => track.id === document.semantics.primaryNarrativeTrackId)!;
+    primary.clips = primary.clips.map((clip) => clip.id === 'second' && clip.kind === 'narrative'
+      ? { ...clip, properties: { ...clip.properties, transIn: { prevId: 'first', effect: 'fade', durationSec: 1 } } }
+      : clip);
+
+    const extendedTail = resizeNarrativeTimelineClip(document, 'first', 'right', 6);
+    expect(extendedTail.ok).toBe(true);
+    expect(extendedTail.document!.timeline.tracks.find((track) => track.id === primary.id)?.clips).toMatchObject([
+      { id: 'first', startFrame: 0, durationFrames: 180, sourceInSec: 0, sourceOutSec: 6 },
+      { id: 'second', startFrame: 180, durationFrames: 150, properties: { treatment: 'full' } },
+    ]);
+    expect((extendedTail.document!.timeline.tracks.find((track) => track.id === primary.id)?.clips[1] as { properties: object }).properties)
+      .not.toHaveProperty('transIn');
+
+    const trimmedHead = resizeNarrativeTimelineClip(extendedTail.document!, 'second', 'left', 7);
+    expect(trimmedHead.document!.timeline.tracks.find((track) => track.id === primary.id)?.clips[1]).toMatchObject({
+      id: 'second', startFrame: 210, durationFrames: 120, sourceInSec: 1, sourceOutSec: 5,
+    });
+  });
+
+  it('restores a packed primary clip from its trimmed source head and ripples later clips', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [
+        { id: 'first-video', kind: 'video', url: 'https://cdn.example/first.mp4', durationSec: 20 },
+        { id: 'middle-video', kind: 'video', url: 'https://cdn.example/middle.mp4', durationSec: 20 },
+        { id: 'last-video', kind: 'video', url: 'https://cdn.example/last.mp4', durationSec: 20 },
+      ],
+    }).document!;
+    document = runAgentTimelineTool(document, 'add_clips', {
+      clips: [
+        { id: 'first', role: 'primary', assetId: 'first-video', startSec: 0, durationSec: 5, sourceInSec: 5, sourceOutSec: 10 },
+        { id: 'middle', role: 'primary', assetId: 'middle-video', startSec: 5, durationSec: 5, sourceInSec: 5, sourceOutSec: 10 },
+        { id: 'last', role: 'primary', assetId: 'last-video', startSec: 10, durationSec: 5 },
+      ],
+    }).document!;
+
+    const extendedHead = resizeNarrativeTimelineClip(document, 'middle', 'left', 4);
+
+    expect(extendedHead.ok).toBe(true);
+    expect(extendedHead.document!.timeline.tracks.find((track) => track.id === document.semantics.primaryNarrativeTrackId)?.clips).toMatchObject([
+      { id: 'first', startFrame: 0, durationFrames: 150 },
+      { id: 'middle', startFrame: 150, durationFrames: 180, sourceInSec: 4, sourceOutSec: 10 },
+      { id: 'last', startFrame: 330, durationFrames: 150 },
+    ]);
+
+    const firstAtZero = resizeNarrativeTimelineClip(document, 'first', 'left', -1);
+    expect(firstAtZero.ok).toBe(true);
+    expect(firstAtZero.document!.timeline.tracks.find((track) => track.id === document.semantics.primaryNarrativeTrackId)?.clips).toMatchObject([
+      { id: 'first', startFrame: 0, durationFrames: 180, sourceInSec: 4, sourceOutSec: 10 },
+      { id: 'middle', startFrame: 180, durationFrames: 150 },
+      { id: 'last', startFrame: 330, durationFrames: 150 },
+    ]);
+  });
+
+  it('slips a primary clip source window without touching timeline geometry, clamped to the asset', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [{ id: 'src-video', kind: 'video', url: 'https://cdn.example/src.mp4', durationSec: 20 }],
+    }).document!;
+    document = runAgentTimelineTool(document, 'add_clips', {
+      clips: [
+        { id: 'held', role: 'primary', assetId: 'src-video', startSec: 0, durationSec: 4, sourceInSec: 5, sourceOutSec: 9 },
+        { id: 'after', role: 'primary', assetId: 'src-video', startSec: 4, durationSec: 2, sourceInSec: 12, sourceOutSec: 14 },
+      ],
+    }).document!;
+
+    const slid = slipNarrativeTimelineClip(document, 'held', 3);
+    expect(slid.ok).toBe(true);
+    expect(slid.document!.timeline.tracks.find((track) => track.id === document.semantics.primaryNarrativeTrackId)?.clips).toMatchObject([
+      { id: 'held', startFrame: 0, durationFrames: 120, sourceInSec: 8, sourceOutSec: 12 },
+      { id: 'after', startFrame: 120, durationFrames: 60, sourceInSec: 12, sourceOutSec: 14 },
+    ]);
+
+    // Tail clamp: asset is 20s, window 8–12 → at most +8 despite asking for +50.
+    const tail = slipNarrativeTimelineClip(slid.document!, 'held', 50);
+    expect(tail.document!.timeline.tracks.flatMap((track) => track.clips).find((clip) => clip.id === 'held')).toMatchObject({
+      sourceInSec: 16, sourceOutSec: 20, startFrame: 0, durationFrames: 120,
+    });
+    // Head clamp: at most back to source zero, span preserved exactly.
+    const head = slipNarrativeTimelineClip(tail.document!, 'held', -999);
+    expect(head.document!.timeline.tracks.flatMap((track) => track.clips).find((clip) => clip.id === 'held')).toMatchObject({
+      sourceInSec: 0, sourceOutSec: 4, startFrame: 0, durationFrames: 120,
+    });
+    // No-op delta returns the same document without a fake mutation.
+    const still = slipNarrativeTimelineClip(head.document!, 'held', 0);
+    expect(still.ok).toBe(true);
+    expect(still.document).toBe(head.document);
   });
 
   it('links and moves typed clips through one shared command path', () => {
@@ -452,6 +755,27 @@ describe('shared agent timeline atoms', () => {
     });
   });
 
+  it('retrims placed video by source clock, preserves playback speed, and ripples later primary clips', () => {
+    const document = emptyEditorDocumentV2({ fps: 30 });
+    document.assets.main = { id: 'main', kind: 'video', locator: { remoteUrl: 'https://cdn.example/main.mp4' }, metadata: { durationSec: 10 } };
+    document.timeline.tracks[0]!.clips = [
+      { id: 'shot-1', kind: 'narrative', assetId: 'main', startFrame: 0, durationFrames: 150, sourceInSec: 0, sourceOutSec: 5, properties: { treatment: 'full' }, enabled: true },
+      { id: 'shot-2', kind: 'narrative', assetId: 'main', startFrame: 150, durationFrames: 150, sourceInSec: 5, sourceOutSec: 10, properties: { treatment: 'full' }, enabled: true },
+    ];
+
+    const retrimmed = runAgentTimelineTool(document, 'set_clip_properties', {
+      items: [{ clipId: 'shot-1', sourceInSec: 1, sourceOutSec: 4 }],
+    });
+    expect(retrimmed.ok).toBe(true);
+    expect(retrimmed.document!.timeline.tracks[0]!.clips).toMatchObject([
+      { id: 'shot-1', startFrame: 0, durationFrames: 90, sourceInSec: 1, sourceOutSec: 4 },
+      { id: 'shot-2', startFrame: 90, durationFrames: 150, sourceInSec: 5, sourceOutSec: 10 },
+    ]);
+    expect(runAgentTimelineTool(retrimmed.document!, 'set_clip_properties', {
+      items: [{ clipId: 'shot-1', sourceOutSec: 12 }],
+    })).toMatchObject({ ok: false, error: expect.stringContaining('inside the asset duration') });
+  });
+
   it('retimes video picture and source audio together while keeping source ranges fixed', () => {
     const document = emptyEditorDocumentV2({ fps: 30 });
     document.assets.main = { id: 'main', kind: 'video', locator: { remoteUrl: 'https://cdn.example/main.mp4' }, metadata: { durationSec: 6, hasAudio: true } };
@@ -477,6 +801,46 @@ describe('shared agent timeline atoms', () => {
     expect(runAgentTimelineTool(document, 'set_video_speed', { all: true, speed: 4.1 }).ok).toBe(false);
   });
 
+  it('places primary footage at natural speed with a full-frame cover anchor', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [{ id: 'portrait', kind: 'video', url: 'https://cdn.example/portrait.mp4', durationSec: 12 }],
+    }).document!;
+
+    const placed = runAgentTimelineTool(document, 'add_clips', { clips: [{
+      id: 'hero', role: 'primary', assetId: 'portrait', startSec: 0,
+      durationSec: 3.2, sourceInSec: 2, sourceOutSec: 5.2, anchorY: 0.62,
+    }] });
+
+    expect(placed.ok).toBe(true);
+    expect(placed.document!.timeline.tracks[0]!.clips[0]).toMatchObject({
+      id: 'hero', durationFrames: 96, sourceInSec: 2, sourceOutSec: 5.2,
+      properties: {
+        treatment: 'full',
+        preciseFraming: {
+          scale: 1, anchorX: 0.5, anchorY: 0.62, coordinateSpace: 'source-normalized',
+        },
+      },
+    });
+    expect((runAgentTimelineTool(placed.document!, 'get_timeline', {}).data as {
+      tracks: Array<{ clips: Array<{ playbackSpeed?: number }> }>;
+    }).tracks[0]!.clips[0]!.playbackSpeed).toBeCloseTo(1, 8);
+  });
+
+  it('rejects primary duration fill disguised as an initial speed or mismatched source range', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', {
+      assets: [{ id: 'portrait', kind: 'video', url: 'https://cdn.example/portrait.mp4', durationSec: 12 }],
+    }).document!;
+
+    expect(runAgentTimelineTool(document, 'add_clips', { clips: [{
+      role: 'primary', assetId: 'portrait', durationSec: 4, sourceInSec: 2, sourceOutSec: 5, speed: 0.75,
+    }] })).toMatchObject({ ok: false, error: expect.stringContaining('natural speed') });
+    expect(runAgentTimelineTool(document, 'add_clips', { clips: [{
+      role: 'primary', assetId: 'portrait', durationSec: 7, sourceInSec: 2, sourceOutSec: 5,
+    }] })).toMatchObject({ ok: false, error: expect.stringContaining('must match') });
+  });
+
   it('removes a cross-track linked batch only once', () => {
     let document = emptyEditorDocumentV2({ fps: 30 });
     document = runAgentTimelineTool(document, 'register_media', { assets: [
@@ -490,6 +854,51 @@ describe('shared agent timeline atoms', () => {
     const removed = runAgentTimelineTool(document, 'remove_clips', { clipIds: ['image-clip', 'audio-clip'] });
     expect(removed.ok).toBe(true);
     expect(removed.document!.timeline.tracks.flatMap((track) => track.clips)).toEqual([]);
+  });
+
+  it('skips clip ids that are already gone and removes the rest, naming the misses', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', { assets: [
+      { id: 'a', kind: 'video', url: 'https://cdn.example/a.mp4', durationSec: 5 },
+      { id: 'b', kind: 'video', url: 'https://cdn.example/b.mp4', durationSec: 5 },
+    ] }).document!;
+    document = runAgentTimelineTool(document, 'add_clips', { clips: [
+      { id: 'a-clip', assetId: 'a', role: 'broll', startSec: 0, durationSec: 2 },
+      { id: 'b-clip', assetId: 'b', role: 'broll', startSec: 3, durationSec: 2 },
+    ] }).document!;
+    document = runAgentTimelineTool(document, 'remove_clips', { clipIds: ['a-clip'] }).document!;
+
+    const removed = runAgentTimelineTool(document, 'remove_clips', { clipIds: ['a-clip', 'b-clip'] });
+    expect(removed.ok).toBe(true);
+    expect(removed.data).toEqual({ removedClipIds: ['b-clip'], missingClipIds: ['a-clip'] });
+    expect(removed.summary).toContain('already gone: a-clip');
+    expect(removed.document!.timeline.tracks.flatMap((track) => track.clips)).toEqual([]);
+
+    const nothingLeft = runAgentTimelineTool(removed.document!, 'remove_clips', { clipIds: ['a-clip', 'b-clip'] });
+    expect(nothingLeft.ok).toBe(false);
+    expect(nothingLeft.error).toContain('clip not found');
+  });
+
+  it('removes the entire primary picture when asked — remove is an honest primitive', () => {
+    let document = emptyEditorDocumentV2({ fps: 30 });
+    document = runAgentTimelineTool(document, 'register_media', { assets: [
+      { id: 'picture', kind: 'video', url: 'https://cdn.example/picture.mp4', durationSec: 5 },
+      { id: 'voice', kind: 'audio', url: 'https://cdn.example/voice.mp3', durationSec: 5 },
+    ] }).document!;
+    document = runAgentTimelineTool(document, 'add_clips', { clips: [
+      { id: 'picture-clip', assetId: 'picture', role: 'primary', durationSec: 5 },
+      { id: 'voice-clip', assetId: 'voice', role: 'narration', durationSec: 5 },
+    ] }).document!;
+
+    // Protecting an assembled cut from agent self-demolition is the harness picture lock's job;
+    // the engine executes the removal (recoverable via undo) instead of vetoing editing intent.
+    const removed = runAgentTimelineTool(document, 'remove_clips', {
+      clipIds: ['picture-clip'],
+      includeLinked: false,
+    });
+    expect(removed.ok).toBe(true);
+    expect(removed.document!.timeline.tracks.find((track) => track.role === 'primaryNarrative')?.clips).toEqual([]);
+    expect(removed.document!.timeline.tracks.find((track) => track.role === 'narration')?.clips).toHaveLength(1);
   });
 
   it('aligns explicit matching markers and links the synced clips', () => {
@@ -528,5 +937,37 @@ describe('shared agent timeline atoms', () => {
       { index: 5, sourceSec: 2.5, timelineSec: 3.25, timelineFrame: 98 },
       { index: 6, sourceSec: 3, timelineSec: 3.5, timelineFrame: 105 },
     ]);
+  });
+});
+
+describe('asset-id typo suggestion', () => {
+  it('names the nearest registered id when a retyped asset id misses', () => {
+    const document = emptyEditorDocumentV2({ fps: 30 });
+    document.assets['local_7be336cc-bbaf-485c-b32a-f2929b2903c9'] = {
+      id: 'local_7be336cc-bbaf-485c-b32a-f2929b2903c9', kind: 'video',
+      locator: { localSig: 'sig-1' }, metadata: { durationSec: 90 },
+    };
+    const outcome = runAgentTimelineTool(document, 'add_clips', {
+      clips: [{ role: 'primary', assetId: 'local:local_76be336cc-bbaf-485c-b32a-f2929b2903c9', sourceInSec: 0, sourceOutSec: 2 }],
+    });
+    expect(outcome.ok).toBe(false);
+    expect((outcome as { error?: string }).error).toContain('Closest registered id: local_7be336cc-bbaf-485c-b32a-f2929b2903c9');
+  });
+
+  it('suggests via unique long prefix when the uuid tail was dropped beyond edit distance', () => {
+    const document = emptyEditorDocumentV2({ fps: 30 });
+    document.assets['local_ef703761-8603-4562-af25-9973fdaae590'] = {
+      id: 'local_ef703761-8603-4562-af25-9973fdaae590', kind: 'video',
+      locator: { localSig: 'sig-a' }, metadata: { durationSec: 90 },
+    };
+    document.assets['local_efe8f32e-27b2-4f14-af6a-c4a430df240e'] = {
+      id: 'local_efe8f32e-27b2-4f14-af6a-c4a430df240e', kind: 'video',
+      locator: { localSig: 'sig-b' }, metadata: { durationSec: 90 },
+    };
+    const outcome = runAgentTimelineTool(document, 'add_clips', {
+      clips: [{ role: 'primary', assetId: 'local:local_ef703761-8603-4562-25', sourceInSec: 0, sourceOutSec: 2 }],
+    });
+    expect(outcome.ok).toBe(false);
+    expect((outcome as { error?: string }).error).toContain('Closest registered id: local_ef703761-8603-4562-af25-9973fdaae590');
   });
 });

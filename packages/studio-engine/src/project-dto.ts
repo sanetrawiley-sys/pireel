@@ -22,7 +22,6 @@ import { canonicalJson, hashSection } from './stable-json';
 export {
   sanitizeProjectContext,
   STUDIO_PROJECT_CONTEXT_SCHEMA_VERSION,
-  legacyLocalAssetId,
   type LocalAssetIndexEntry,
   type StudioProjectContext,
 } from './project-context';
@@ -49,6 +48,9 @@ export interface TranscriptSegment {
   cueTexts?: Record<string, string>;
   /** Stable display-cue boundaries encoded as source word ranges "w0:w1". */
   cueLayout?: string[];
+  /** Provisional timing derived from an exact script (TTS text) — no ASR has measured it yet. Once
+   *  measured, the script text stays and only the timing changes (script-alignment.ts). */
+  scripted?: boolean;
   /** Target language sub/cueSubs were translated into (unset = unknown/legacy — displayed as-is). */
   subLang?: string;
   /** Short-lived extraction-cueing scheme flag (desegmentCues merges these back into sentences on load). */
@@ -94,7 +96,9 @@ export interface ProjectSavePayload {
   context?: StudioProjectContext;
   videoSig: string | null;
   videoDurationSec: number | null;
-  coverThumb: string | null;
+  /** Optional legacy lane: covers now travel as bytes through ProjectStore.saveCover (an R2 key
+   * lands in the row); base64 here multiplied every save/list payload. Absent = untouched. */
+  coverThumb?: string | null;
 }
 
 /** Save payload cap (document graphics can be sizable, but keep it bounded). */
@@ -286,7 +290,12 @@ export function buildSaveWire(
     context: contextCanon != null
       ? hashSection(contextCanon)
       : (acked?.hashes.context ?? hashSection(canonicalJson(sanitizeProjectContext(null)))),
-    coverThumb: hashSection(p.coverThumb ?? ''),
+    // Absent cover = preserve (same contract as title): covers now travel as bytes through
+    // ProjectStore.saveCover, so a payload without the field must not read as "cover cleared"
+    // nor emit a fake no-op section against a server row that holds a cover key.
+    coverThumb: p.coverThumb !== undefined
+      ? hashSection(p.coverThumb ?? '')
+      : (acked?.hashes.coverThumb ?? hashSection('')),
     meta: metaHashOf(effectiveTitle, p.videoSig, p.videoDurationSec),
   };
   // JSON-clean current values (parsed from the canonical string: incidentally drops undefined, so diff is structurally comparable to the baseline)
@@ -322,7 +331,7 @@ export function buildSaveWire(
   if (documentCanon != null) emitBig('document', documentCanon, true);
   if (contextCanon != null) emitBig('context', contextCanon, true);
 
-  if (!acked || acked.hashes.coverThumb !== hashes.coverThumb) {
+  if (p.coverThumb !== undefined && (!acked || acked.hashes.coverThumb !== hashes.coverThumb)) {
     wire.coverThumb = p.coverThumb;
     changed = true;
   }

@@ -16,7 +16,7 @@
  */
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeftRight, Clapperboard, Eye, EyeOff, Film, Loader2, Music, Plus, VideoOff, Volume2, VolumeX } from 'lucide-react';
+import { ArrowLeftRight, Clapperboard, Eye, EyeOff, Film, GalleryHorizontal, Loader2, Music, Plus, VideoOff, Volume2, VolumeX } from 'lucide-react';
 import {
   type Block,
   type BlockKind,
@@ -35,7 +35,11 @@ import { KIND_META } from './kind-meta';
 import { blockDisplayTitle } from './block-display-title';
 import { t } from './i18n';
 import { playhead } from './playhead';
-import type { FilmstripFrame } from './media';
+import {
+  type FilmstripFrame,
+  type FilmstripSourceRange,
+  filmstripSourceRangeForTimelineWindow,
+} from './media';
 import {
   CAP_LANE,
   EDGE_PAD,
@@ -86,7 +90,7 @@ export { DEFAULT_PPS, MAX_PPS, MIN_PPS } from './timeline-utils';
 
 /** Height of the audio strip drawn along the bottom of each scene card (the video's own sound). */
 const SCENE_WAVE_H = 18;
-/** Palmier keeps a permanent bottom drop zone instead of inserting a temporary dashed row. */
+/** Professional NLEs keep a permanent bottom drop zone instead of inserting a temporary dashed row. */
 const VISUAL_TRACK_DROP_ZONE_H = 38;
 const VIDEO_CLIP_H = SCENE_H - SCENE_PAD_T - SCENE_PAD_B;
 const VISUAL_VIDEO_CLIP_H = VISUAL_SCENE_H - VISUAL_SCENE_PAD_T - VISUAL_SCENE_PAD_B;
@@ -170,6 +174,15 @@ interface StudioTimelineProps {
   onBoxSelectShots: (ids: string[]) => void;
   /** Move a primary clip in time or onto another visual lane. The destination uses overwrite semantics. */
   onMoveShot?: (id: string, startSec: number, target: TimelineMediaDropTarget) => void;
+  /** Trim/extend a primary clip from either edge; packed-edge extensions ripple the magnetic main track. */
+  onResizeShot?: (id: string, edge: 'left' | 'right', atSec: number) => void;
+  /** Slip a shot's source window by SOURCE seconds (position/duration fixed). Alt-drag on the body. */
+  onSlipShot?: (id: string, sourceDeltaSec: number) => void;
+  /** Source total duration per shot id — enables the slip panel and live tail clamping. */
+  shotSourceDurations?: ReadonlyMap<string, number>;
+  /** Live slip window (source clock) while a slip gesture is active; null on release. The host
+   *  renders the two-up (new first/last frame) over the preview stage. */
+  onSlipPreview?: (state: { shotId: string; startSec: number; endSec: number } | null) => void;
   /** Move a block across physical tracks. trackId is canonical; stackOrder is retained only for legacy hosts. */
   onMoveBlockTrack?: (id: string, target: TimelineBlockTrackTarget, startSec: number) => void;
   /** Drag a block into any native row boundary and create a graphics track at that document index. */
@@ -234,6 +247,8 @@ interface StudioTimelineProps {
   onOpenMusicPanel?: () => void;
   /** Filmstrips for externally inserted clips (shotId -> frames, t = the clip's own source time). */
   clipStrips?: Record<string, FilmstripFrame[]>;
+  /** Visible timeline window translated into source-clock thumbnail demand. */
+  onFilmstripDemandChange?: (demand: Record<string, FilmstripSourceRange[]>) => void;
   /** Per-asset missing-source UI: is the main source's File loaded this session? Default true (hosts without the signal). */
   mainLive?: boolean;
   /** Per-asset missing-source UI: are this clip source's bytes reachable? Default live. */
@@ -326,6 +341,10 @@ function StudioTimelineImpl({
   onSelectShot,
   onBoxSelectShots,
   onMoveShot,
+  onResizeShot,
+  onSlipShot,
+  shotSourceDurations,
+  onSlipPreview,
   onMoveBlockTrack,
   onMoveBlockNewTrack,
   onSelectBlock,
@@ -366,6 +385,7 @@ function StudioTimelineImpl({
   onResizeTransition,
   clipPendingAt,
   clipStrips,
+  onFilmstripDemandChange,
   mainLive = true,
   srcLive,
 }: StudioTimelineProps) {
@@ -436,6 +456,158 @@ function StudioTimelineImpl({
   } | null>(null);
   const [audioDropTarget, setAudioDropTarget] = useState<AudioLaneMoveTarget | null>(null);
   const [trDrag, setTrDrag] = useState<{ cut: number; half: number } | null>(null); // live half-width while dragging a transition handle (symmetric)
+  const [shotResize, setShotResize] = useState<{
+    shotId: string;
+    edge: 'left' | 'right';
+    atSec: number;
+  } | null>(null);
+  /** Slip ghost (alt-drag on a shot body): shifts WHICH source range plays, position/duration
+   *  fixed. deltaSec is in SOURCE seconds; the filmstrip re-windows live, commit on release. */
+  const [shotSlip, setShotSlip] = useState<{ shotId: string; deltaSec: number } | null>(null);
+  /** Slip panel (取窗浮窗): the whole source as one strip with the current window as a draggable
+   *  selection box — the discoverable way to relocate a shot inside its source. */
+  const [slipPanel, setSlipPanel] = useState<string | null>(null);
+  const slipPanelRef = useRef<HTMLDivElement | null>(null);
+  /** Panel zoom view: null = the DEFAULT view (timeline-scale, window aligned under the card);
+   *  otherwise an explicit zoomed sub-range. The geometry mirror below carries the RESOLVED
+   *  current view each render so in-flight gestures and native listeners share one truth. */
+  const [slipView, setSlipView] = useState<{ zoom: number; startSec: number } | null>(null);
+  const slipStripRef = useRef<HTMLDivElement | null>(null);
+  const slipPanelGeomRef = useRef<{
+    dur: number;
+    W: number;
+    zoom: number;
+    viewStart: number;
+    viewLen: number;
+  } | null>(null);
+  // Same zoom language as the timeline itself: ctrl/meta + wheel (trackpad pinch arrives as
+  // ctrl+wheel) zooms anchored on the cursor; a plain wheel pans the zoomed view; a real
+  // two-finger touch pinch zooms around the touch midpoint. Native non-passive listener —
+  // React's wheel handler cannot preventDefault the page scroll.
+  useEffect(() => {
+    const el = slipPanelRef.current;
+    if (!slipPanel || !el) return;
+    const zoomAt = (clientX: number, factor: number) => {
+      const geom = slipPanelGeomRef.current;
+      if (!geom) return;
+      const zoom = Math.min(16, Math.max(1, geom.zoom * factor));
+      if (Math.abs(zoom - geom.zoom) < 1e-4) return;
+      const len = geom.dur / zoom;
+      const box = (slipStripRef.current ?? el).getBoundingClientRect();
+      const frac = Math.min(1, Math.max(0, (clientX - box.left) / geom.W));
+      const anchor = geom.viewStart + frac * geom.viewLen;
+      setSlipView({
+        zoom,
+        startSec: Math.min(Math.max(anchor - frac * len, 0), Math.max(0, geom.dur - len)),
+      });
+    };
+    const onWheel = (ev: WheelEvent) => {
+      // The panel swallows every wheel event: the timeline's scroll surface sits underneath
+      // and would otherwise zoom/scroll the TRACK together with the panel.
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (ev.ctrlKey || ev.metaKey) {
+        zoomAt(ev.clientX, ev.deltaY < 0 ? 1.1 : 0.9);
+        return;
+      }
+      const geom = slipPanelGeomRef.current;
+      if (!geom || geom.zoom <= 1 + 1e-4) return; // whole source visible: nothing to pan
+      const dominant = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+      const startSec = Math.min(
+        Math.max(geom.viewStart + (dominant / geom.W) * geom.viewLen, 0),
+        Math.max(0, geom.dur - geom.viewLen),
+      );
+      setSlipView({ zoom: geom.zoom, startSec });
+    };
+    const touches = new Map<number, number>();
+    let pinchBase: { dist: number; zoom: number } | null = null;
+    const onPointerDown = (ev: PointerEvent) => {
+      if (ev.pointerType !== 'touch') return;
+      touches.set(ev.pointerId, ev.clientX);
+      if (touches.size === 2) {
+        const [a, b] = [...touches.values()];
+        pinchBase = {
+          dist: Math.max(8, Math.abs(a - b)),
+          zoom: slipPanelGeomRef.current?.zoom ?? 1,
+        };
+      }
+    };
+    const onPointerMove = (ev: PointerEvent) => {
+      if (!touches.has(ev.pointerId)) return;
+      touches.set(ev.pointerId, ev.clientX);
+      if (touches.size !== 2 || !pinchBase) return;
+      const [a, b] = [...touches.values()];
+      const zoomNow = slipPanelGeomRef.current?.zoom ?? 1;
+      const target = Math.min(16, Math.max(1, pinchBase.zoom * (Math.max(8, Math.abs(a - b)) / pinchBase.dist)));
+      if (Math.abs(target - zoomNow) > 0.01) zoomAt((a + b) / 2, target / zoomNow);
+    };
+    const onPointerEnd = (ev: PointerEvent) => {
+      touches.delete(ev.pointerId);
+      if (touches.size < 2) pinchBase = null;
+    };
+    el.addEventListener('wheel', onWheel, { passive: false });
+    el.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('pointermove', onPointerMove);
+    window.addEventListener('pointerup', onPointerEnd);
+    window.addEventListener('pointercancel', onPointerEnd);
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      el.removeEventListener('pointerdown', onPointerDown);
+      window.removeEventListener('pointermove', onPointerMove);
+      window.removeEventListener('pointerup', onPointerEnd);
+      window.removeEventListener('pointercancel', onPointerEnd);
+    };
+  }, [slipPanel]);
+  // Click-outside / Esc closes the panel. Presses on a slip trigger button are exempt — the
+  // button's own toggle owns that interaction (close-then-toggle would reopen it).
+  useEffect(() => {
+    if (!slipPanel) return;
+    const onDown = (event: PointerEvent) => {
+      const target = event.target as Element | null;
+      if (slipPanelRef.current?.contains(target)) return;
+      if (target?.closest?.('[data-slip-trigger]')) return;
+      setSlipPanel(null);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSlipPanel(null);
+    };
+    document.addEventListener('pointerdown', onDown, true);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('pointerdown', onDown, true);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [slipPanel]);
+  // Every source-window ghost feeds the host's two-up: slip (alt-drag + panel body) shifts the
+  // whole window, and a trim ghost (panel handles + card edges alike) moves one end of it.
+  const onSlipPreviewRef = useRef(onSlipPreview);
+  onSlipPreviewRef.current = onSlipPreview;
+  useEffect(() => {
+    const publish = onSlipPreviewRef.current;
+    if (!publish) return;
+    const activeShotId = shotSlip?.shotId ?? shotResize?.shotId;
+    if (!activeShotId) {
+      publish(null);
+      return;
+    }
+    const span = sceneSpans.find((candidate) => candidate.shot.id === activeShotId);
+    if (!span) return;
+    let startSec = span.shot.srcStart;
+    let endSec = span.shot.srcEnd;
+    if (shotSlip) {
+      startSec += shotSlip.deltaSec;
+      endSec += shotSlip.deltaSec;
+    } else if (shotResize) {
+      const rate = (span.shot.srcEnd - span.shot.srcStart) / Math.max(0.001, span.end - span.start);
+      if (shotResize.edge === 'left') {
+        startSec = Math.min(Math.max(0, span.shot.srcStart + (shotResize.atSec - span.start) * rate), endSec - 0.05);
+      } else {
+        endSec = Math.max(span.shot.srcEnd + (shotResize.atSec - span.end) * rate, startSec + 0.05);
+      }
+    }
+    publish({ shotId: span.shot.id, startSec, endSec });
+  }, [shotSlip, shotResize, sceneSpans]);
+  useEffect(() => () => onSlipPreviewRef.current?.(null), []);
   const [captionResize, setCaptionResize] = useState<{
     id: string;
     startSec: number;
@@ -450,6 +622,7 @@ function StudioTimelineImpl({
   const [marquee, setMarquee] = useState<{ l: number; r: number } | null>(null); // scene-track marquee rectangle (content px)
   const laneRef = useRef<HTMLDivElement | null>(null); // scene-track DOM (content-coordinate base, moves with scroll)
   const marqueeDraggedRef = useRef(false); // whether this pointer-down became a marquee drag (used to suppress the subsequent shot click)
+  const shotResizeMovedRef = useRef(false); // suppress the click synthesized after a main-clip edge trim
   const [blockMarquee, setBlockMarquee] = useState<{ l: number; r: number; t: number; b: number } | null>(null); // element-track marquee rectangle (tracksRef px, includes y for cross-track)
   const tracksRef = useRef<HTMLDivElement | null>(null); // track background area DOM (coordinate base for block marquee)
   const blockMarqueeDraggedRef = useRef(false); // whether the block marquee became a drag (suppress the subsequent block click)
@@ -458,6 +631,7 @@ function StudioTimelineImpl({
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const [visibleRange, setVisibleRange] = useState({ startSec: 0, endSec: 30 });
+  const filmstripDemandKeyRef = useRef('');
   const draggingRef = useRef(false); // while dragging: let hover-seek yield (avoid double seek)
   const framePickConsumedRef = useRef(false); // suppress the click synthesized after a capture-phase frame pick
   const hoverRaf = useRef(0); // hover rAF coalescing
@@ -519,6 +693,68 @@ function StudioTimelineImpl({
     observer.observe(el);
     return () => observer.disconnect();
   }, [updateVisibleRange]);
+  useEffect(() => {
+    if (!onFilmstripDemandChange) return;
+    const demand: Record<string, FilmstripSourceRange[]> = {};
+    const addVisibleSourceRange = (
+      source: string | undefined,
+      timelineStartSec: number,
+      timelineEndSec: number,
+      sourceInSec: number,
+      sourceOutSec: number,
+    ) => {
+      if (!source) return;
+      const range = filmstripSourceRangeForTimelineWindow(
+        timelineStartSec,
+        timelineEndSec,
+        sourceInSec,
+        sourceOutSec,
+        visibleRange.startSec,
+        visibleRange.endSec,
+      );
+      if (range) (demand[source] ??= []).push(range);
+    };
+    for (const span of sceneSpans) {
+      addVisibleSourceRange(span.shot.src, span.start, span.end, span.shot.srcStart, span.shot.srcEnd);
+      // A live slip re-windows the filmstrip outside the committed source range; demand a padded
+      // window around the slid position so the tiles exist while the pointer is still moving
+      // (the consumer dedupes by bucket, so this only fetches genuinely new frames).
+      if (shotSlip?.shotId === span.shot.id && span.shot.src) {
+        const pad = 8;
+        (demand[span.shot.src] ??= []).push({
+          startSec: Math.max(0, span.shot.srcStart + shotSlip.deltaSec - pad),
+          endSec: span.shot.srcEnd + shotSlip.deltaSec + pad,
+        });
+      }
+      // The slip panel shows the WHOLE source; demand it once (bucket grid caps tile count).
+      // A zoomed view also demands its sub-range — the shorter range yields a finer bucket step.
+      if (slipPanel === span.shot.id && span.shot.src) {
+        const dur = shotSourceDurations?.get(span.shot.id);
+        if (dur) {
+          (demand[span.shot.src] ??= []).push({ startSec: 0, endSec: dur });
+          // Zoomed views (including the timeline-scale default) demand their sub-range —
+          // the shorter range yields a finer bucket step. Geometry is render-synced.
+          const geom = slipPanelGeomRef.current;
+          if (geom && geom.zoom > 1) {
+            (demand[span.shot.src] ??= []).push({
+              startSec: geom.viewStart,
+              endSec: geom.viewStart + geom.viewLen,
+            });
+          }
+        }
+      }
+    }
+    for (const track of trackStates ?? []) {
+      for (const clip of track.clips ?? []) {
+        if (clip.kind !== 'video' || clip.usePrimaryFilmstrip) continue;
+        addVisibleSourceRange(clip.source, clip.startSec, clip.endSec, clip.sourceInSec, clip.sourceOutSec);
+      }
+    }
+    const key = JSON.stringify(demand);
+    if (key === filmstripDemandKeyRef.current) return;
+    filmstripDemandKeyRef.current = key;
+    onFilmstripDemandChange(demand);
+  }, [onFilmstripDemandChange, sceneSpans, shotSlip, slipPanel, slipView, shotSourceDurations, trackStates, visibleRange]);
   // Static snap points include every visible clip edge. The playhead changes every frame, so it is
   // appended dynamically at snap time rather than invalidating this memo during playback.
   const snapPoints = useMemo(() => {
@@ -1222,7 +1458,10 @@ function StudioTimelineImpl({
       const dy = ev.clientY - sy;
       const center = rowTop(track) + rowH(track) / 2 + dy;
       const others = reorderableTracks.filter((candidate) => candidate !== track);
-      const toIndex = others.filter((candidate) => center > rowTop(candidate) + rowH(candidate) / 2).length;
+      let toIndex = others.filter((candidate) => center > rowTop(candidate) + rowH(candidate) / 2).length;
+      // Nothing lands above the pinned caption lane
+      const captionIdx = others.indexOf(CAP_LANE);
+      if (captionIdx >= 0 && toIndex <= captionIdx) toIndex = captionIdx + 1;
       const before = others[toIndex];
       const after = others[toIndex - 1];
       const toSlot = before != null ? dispIdx.get(before)! : after != null ? dispIdx.get(after)! + 1 : fromSlot;
@@ -1299,6 +1538,46 @@ function StudioTimelineImpl({
           onMoveShot(span.shot.id, current.startSec, current.target);
         }
         setTimeout(() => { shotDragMovedRef.current = false; }, 0);
+      },
+    );
+  };
+
+  const shotSlipRef = useRef(shotSlip);
+  shotSlipRef.current = shotSlip;
+  const shotSlipMovedRef = useRef(false);
+  /** Alt-drag on a shot body: slip the source window (which range plays), position/duration
+   *  fixed. Content follows the pointer — dragging RIGHT reveals EARLIER material. Head clamps
+   *  at source zero live; tail clamps live only when the source duration is known from mounted
+   *  peaks (the engine performs the authoritative tail clamp again on commit). */
+  const startShotSlip = (e: React.PointerEvent, from: number) => {
+    if (e.button !== 0 || !onSlipShot) return;
+    const span = sceneSpans[from];
+    if (!span) return;
+    const sourceRate = (span.shot.srcEnd - span.shot.srcStart) / Math.max(0.001, span.end - span.start);
+    const sourceDurationSec = shotSourceDurations?.get(span.shot.id)
+      ?? sourcePeaks?.get(span.shot.src ?? 'main')?.durationSec;
+    const grabSec = secAt(e.clientX);
+    shotSlipMovedRef.current = false;
+    drag(
+      e,
+      (clientX) => {
+        shotSlipMovedRef.current = true;
+        let deltaSec = -(secAt(clientX) - grabSec) * sourceRate;
+        deltaSec = Math.max(-span.shot.srcStart, deltaSec);
+        if (sourceDurationSec != null && sourceDurationSec > 0) {
+          deltaSec = Math.min(deltaSec, Math.max(0, sourceDurationSec - span.shot.srcEnd));
+        }
+        const next = { shotId: span.shot.id, deltaSec };
+        shotSlipRef.current = next;
+        setShotSlip(next);
+      },
+      (moved) => {
+        const current = shotSlipRef.current;
+        setShotSlip(null);
+        if (moved && current?.shotId === span.shot.id && Math.abs(current.deltaSec) > 0.001) {
+          onSlipShot(span.shot.id, current.deltaSec);
+        }
+        setTimeout(() => { shotSlipMovedRef.current = false; }, 0);
       },
     );
   };
@@ -1482,7 +1761,8 @@ function StudioTimelineImpl({
                       : KIND_META[k];
                 const Icon = meta.icon;
                 const dragging = trackDrag?.track === track;
-                const draggable = nativeTrack != null;
+                // The caption lane is pinned on top (engine caption-stack): no drag handle for it.
+                const draggable = nativeTrack != null && track !== CAP_LANE;
                 return (
                   <div
                     key={track}
@@ -1559,6 +1839,12 @@ function StudioTimelineImpl({
             }}
             onMouseMove={(e) => {
               if (draggingRef.current) return; // during drag onSeek handles it, don't also hover-seek
+              // The slip panel is its own surface: hovering it must not scrub the main preview
+              // (and an already-armed scrub ends so the preview returns to the playhead).
+              if (slipPanelRef.current?.contains(e.target as Node)) {
+                endScrubRef.current();
+                return;
+              }
               hoverXRef.current = e.clientX;
               if (framePickActive) {
                 scrubArmedRef.current = true;
@@ -1714,7 +2000,34 @@ function StudioTimelineImpl({
                   {sceneSpans.map(({ shot, start, end }, i) => {
                     const sel = selectedShotIds.has(shot.id);
                     const enabled = placementEnabled.get(shot.id) ?? true;
-                    const shotLen = end - start;
+                    const liveResize = shotResize?.shotId === shot.id ? shotResize : null;
+                    const sourceRate = (shot.srcEnd - shot.srcStart) / Math.max(0.001, end - start);
+                    const sourceFloor = sourceRate > 0 ? start - shot.srcStart / sourceRate : start;
+                    const previousEnd = sceneSpans[i - 1]?.end ?? 0;
+                    const packedAtStart = Math.abs(previousEnd - start) < 0.001;
+                    const liveHeadRipple = liveResize?.edge === 'left' && packedAtStart && liveResize.atSec < start;
+                    const displayStart = liveResize?.edge === 'left'
+                      ? liveHeadRipple
+                        ? start
+                        : Math.max(0, sourceFloor, previousEnd, Math.min(liveResize.atSec, end - 0.2))
+                      : start;
+                    const displayEnd = liveHeadRipple
+                      ? end + start - liveResize.atSec
+                      : liveResize?.edge === 'right'
+                        ? Math.max(start + 0.2, liveResize.atSec)
+                        : end;
+                    const liveSlip = shotSlip?.shotId === shot.id ? shotSlip : null;
+                    const displaySourceStart = liveSlip
+                      ? shot.srcStart + liveSlip.deltaSec
+                      : liveResize?.edge === 'left'
+                        ? shot.srcStart + (liveResize.atSec - start) * sourceRate
+                        : shot.srcStart;
+                    const displaySourceEnd = liveSlip
+                      ? shot.srcEnd + liveSlip.deltaSec
+                      : liveResize?.edge === 'right'
+                        ? shot.srcEnd + (displayEnd - end) * sourceRate
+                        : shot.srcEnd;
+                    const shotLen = displayEnd - displayStart;
                     const gapR = i < sceneSpans.length - 1 ? SHOT_GAP : 0; // hairline gap off the right edge, left edge stays time-accurate
                     const w = Math.max(8, x(shotLen) - gapR);
                     const dragged = shotDrag?.from === i;
@@ -1725,10 +2038,22 @@ function StudioTimelineImpl({
                           // Card press enters exact-time movement; stopPropagation keeps marquee selection separate.
                           onPointerDown={(e) => {
                             e.stopPropagation();
+                            if (e.altKey && onSlipShot) {
+                              startShotSlip(e, i);
+                              return;
+                            }
                             startShotDrag(e, i);
                           }}
                           onClick={(e) => {
                             e.stopPropagation();
+                            if (shotResizeMovedRef.current) {
+                              shotResizeMovedRef.current = false;
+                              return;
+                            }
+                            if (shotSlipMovedRef.current) {
+                              shotSlipMovedRef.current = false; // tail of a slip drag, not a click
+                              return;
+                            }
                             if (shotDragMovedRef.current) {
                               shotDragMovedRef.current = false; // this is the tail of a clip drag, not a click
                               return;
@@ -1744,11 +2069,35 @@ function StudioTimelineImpl({
                           onDoubleClick={(e) => e.stopPropagation()}
                           aria-label={t('panels.sceneNShotName', { n: i + 1, name: t(TREATMENT_NAME[shot.treatment] ?? shot.treatment) })}
                           aria-disabled={!enabled}
-                          className={`bg-ink/10 absolute overflow-hidden text-left ${TIMELINE_ITEM_RADIUS} ${!enabled ? 'opacity-45 grayscale ' : ''}${
+                          className={`group/shot bg-ink/10 absolute overflow-hidden text-left ${TIMELINE_ITEM_RADIUS} ${!enabled ? 'opacity-45 grayscale ' : ''}${
                             dragged ? 'opacity-30 ring-1 ring-white/10' : sel ? 'transition ring-2 ring-accent/70' : 'transition ring-1 ring-white/10 hover:ring-accent/40'
                           }`}
-                          style={{ left: x(start), width: w, top: SCENE_PAD_T, height: H0 - SCENE_PAD_T - SCENE_PAD_B }}
+                          style={{ left: x(displayStart), width: w, top: SCENE_PAD_T, height: H0 - SCENE_PAD_T - SCENE_PAD_B }}
                         >
+                          {liveSlip ? (
+                            <div className="pointer-events-none absolute left-1 top-1 z-10 rounded bg-black/70 px-1.5 py-0.5 text-[10px] tabular-nums text-white">
+                              {`${displaySourceStart.toFixed(1)}s – ${displaySourceEnd.toFixed(1)}s`}
+                            </div>
+                          ) : null}
+                          {onSlipShot && (shotSourceDurations?.get(shot.id) ?? 0) > 0 ? (
+                            <span
+                              role="button"
+                              tabIndex={-1}
+                              data-slip-trigger
+                              title={t('panels.slipWindowOpen')}
+                              aria-label={t('panels.slipWindowOpen')}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onSelectShot(shot.id, false);
+                                setSlipView(null);
+                                setSlipPanel((current) => (current === shot.id ? null : shot.id));
+                              }}
+                              className={`absolute right-3 top-0.5 z-30 h-4 w-4 items-center justify-center rounded bg-black/60 text-white/90 hover:bg-black/85 ${slipPanel === shot.id ? 'flex' : 'hidden group-hover/shot:flex'}`}
+                            >
+                              <GalleryHorizontal size={10} />
+                            </span>
+                          ) : null}
                           {/* Filmstrip (clipped inside the card: rounded corners / hairline gaps from the card's overflow-hidden).
                               Externally inserted clip: the main filmstrip is the main video's frames, so pasting it would be wrong — lay down its own extracted frames
                               (clipStrips, t = clip source time; before frames are extracted, show a dedicated placeholder background) */}
@@ -1759,8 +2108,8 @@ function StudioTimelineImpl({
                                 const strip = (shot.src ? clipStrips?.[shot.src] : null) ?? [];
                                 if (!strip.length) return <div className="absolute inset-0 bg-gradient-to-r from-sky-500/35 to-sky-500/15" />;
                                 if (end < visibleRange.startSec || start > visibleRange.endSec) return null;
-                                return visibleStripTiles(strip, shot.srcStart, shot.srcEnd, tileDur, pps, start, visibleRange.startSec, visibleRange.endSec).map((tl, ti) => (
-                                  <img key={ti} data-film-tile src={tl.url} aria-hidden="true" loading="lazy" decoding="async" draggable={false} className="max-w-none absolute top-0 object-cover" style={{ left: tl.left, width: thumbW, height: filmH }} />
+                                return visibleStripTiles(strip, displaySourceStart, displaySourceEnd, tileDur, pps, displayStart, visibleRange.startSec, visibleRange.endSec, displayEnd).map((tl, ti) => (
+                                  <img key={ti} data-film-tile src={tl.url} aria-hidden="true" loading="lazy" decoding="async" draggable={false} className="max-w-none absolute top-0 object-cover" style={{ left: tl.left, width: tl.width, height: filmH }} />
                                 ));
                               })()}
                             </div>
@@ -1770,8 +2119,8 @@ function StudioTimelineImpl({
                             </div>
                           ) : (
                             <>
-                              {end >= visibleRange.startSec && start <= visibleRange.endSec && visibleStripTiles(filmstrip ?? [], shot.srcStart, shot.srcEnd, tileDur, pps, start, visibleRange.startSec, visibleRange.endSec).map((tl, ti) => (
-                                <img key={ti} data-film-tile src={tl.url} aria-hidden="true" loading="lazy" decoding="async" draggable={false} className="max-w-none pointer-events-none absolute top-0 object-cover" style={{ left: tl.left, width: thumbW, height: filmH }} />
+                              {displayEnd >= visibleRange.startSec && displayStart <= visibleRange.endSec && visibleStripTiles(filmstrip ?? [], displaySourceStart, displaySourceEnd, tileDur, pps, displayStart, visibleRange.startSec, visibleRange.endSec, displayEnd).map((tl, ti) => (
+                                <img key={ti} data-film-tile src={tl.url} aria-hidden="true" loading="lazy" decoding="async" draggable={false} className="max-w-none pointer-events-none absolute top-0 object-cover" style={{ left: tl.left, width: tl.width, height: filmH }} />
                               ))}
                               {(filmstrip ?? []).length === 0 && <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-accent/20 to-accent/8" />}
                             </>
@@ -1801,10 +2150,285 @@ function StudioTimelineImpl({
                           })()}
                           {/* Index number */}
                           <span className="absolute left-1 top-1 rounded bg-black/55 px-1 text-[9px] font-semibold leading-[14px] text-white">{i + 1}</span>
+                          {(['left', 'right'] as const).map((edge) => (
+                            <span
+                              key={edge}
+                              role="none"
+                              data-shot-trim-edge={edge}
+                              onPointerDown={(event) => {
+                                event.stopPropagation();
+                                if (!onResizeShot || event.button !== 0) return;
+                                onSelectShot(shot.id, false);
+                                let latest = edge === 'left' ? start : end;
+                                setShotResize({ shotId: shot.id, edge, atSec: latest });
+                                setEndResizeSec(end);
+                                drag(
+                                  event,
+                                  (clientX) => {
+                                    const requested = snap(edge === 'left'
+                                      ? rawSecAt(clientX)
+                                      : timelinePointerSecond(rawSecAt(clientX), dur, true));
+                                    latest = edge === 'left'
+                                      ? Math.max(
+                                          packedAtStart ? sourceFloor : Math.max(0, sourceFloor, previousEnd),
+                                          Math.min(requested, end - 0.2),
+                                        )
+                                      : Math.max(start + 0.2, requested);
+                                    setShotResize({ shotId: shot.id, edge, atSec: latest });
+                                    setEndResizeSec(edge === 'left' && packedAtStart && latest < start
+                                      ? end + start - latest
+                                      : edge === 'right'
+                                        ? latest
+                                        : end);
+                                    setGuide(latest);
+                                  },
+                                  (moved) => {
+                                    setShotResize(null);
+                                    setEndResizeSec(null);
+                                    if (moved) {
+                                      shotResizeMovedRef.current = true;
+                                      onResizeShot(shot.id, edge, latest);
+                                    }
+                                  },
+                                );
+                              }}
+                              className={`absolute inset-y-0 z-20 w-2 cursor-ew-resize transition-colors ${edge === 'left' ? `left-0 ${TIMELINE_ITEM_EDGE_RADIUS.left}` : `right-0 ${TIMELINE_ITEM_EDGE_RADIUS.right}`} ${sel ? 'bg-white/55' : 'bg-white/0 group-hover/shot:bg-white/55'}`}
+                            />
+                          ))}
                         </button>
                       </div>
                     );
                   })}
+                  {/* Slip panel: the source as one strip, current window = draggable selection box.
+                      Body drag = slip (same shotSlip ghost as alt-drag; card filmstrip re-windows
+                      live; commit once on release). Edge handles = TRIM (drives the same shotResize
+                      ghost as the card edges, commits through onResizeShot with its ripple rules).
+                      −/+/1x zooms the strip around the window; the view follows the window while
+                      dragging at zoom. Click anywhere = center the window there. */}
+                  {slipPanel ? (() => {
+                    const span = sceneSpans.find((candidate) => candidate.shot.id === slipPanel);
+                    const dur = span ? shotSourceDurations?.get(span.shot.id) : undefined;
+                    if (!span || !dur || !onSlipShot) return null;
+                    const strip = (span.shot.src ? clipStrips?.[span.shot.src] : filmstrip) ?? [];
+                    const rate = (span.shot.srcEnd - span.shot.srcStart) / Math.max(0.001, span.end - span.start);
+                    const minSpanSrc = Math.max(0.05, 0.2 * rate);
+                    const live = shotSlip?.shotId === span.shot.id ? shotSlip.deltaSec : 0;
+                    const liveTrim = shotResize?.shotId === span.shot.id ? shotResize : null;
+                    const winLen0 = span.shot.srcEnd - span.shot.srcStart;
+                    let winStart = span.shot.srcStart + live;
+                    let winEnd = span.shot.srcEnd + live;
+                    if (liveTrim?.edge === 'left') {
+                      winStart = Math.min(Math.max(0, span.shot.srcStart + (liveTrim.atSec - span.start) * rate), winEnd - minSpanSrc);
+                    } else if (liveTrim?.edge === 'right') {
+                      winEnd = Math.max(Math.min(dur, span.shot.srcEnd + (liveTrim.atSec - span.end) * rate), winStart + minSpanSrc);
+                    }
+                    winStart = Math.max(0, winStart);
+                    winEnd = Math.min(dur, Math.max(winEnd, winStart + minSpanSrc));
+                    const W = Math.max(240, Math.min(960, x(visibleRange.endSec - visibleRange.startSec) - 24));
+                    // DEFAULT view (slipView null): timeline scale — panel pps equals the track's
+                    // pps — centred on the current window.
+                    let zoom: number;
+                    let viewStart: number;
+                    if (slipView) {
+                      zoom = Math.min(16, Math.max(1, slipView.zoom));
+                      viewStart = Math.min(Math.max(slipView.startSec, 0), Math.max(0, dur - dur / zoom));
+                    } else {
+                      zoom = Math.min(16, Math.max(1, (dur * pps) / W));
+                      const viewLenDefault = dur / zoom;
+                      viewStart = Math.min(
+                        Math.max((winStart + winEnd) / 2 - viewLenDefault / 2, 0),
+                        Math.max(0, dur - viewLenDefault),
+                      );
+                    }
+                    const viewLen = dur / zoom;
+                    const viewEnd = viewStart + viewLen;
+                    slipPanelGeomRef.current = { dur, W, zoom, viewStart, viewLen };
+                    // Fixed positioning floats the panel ABOVE the timeline, horizontally centred
+                    // in the visible timeline area and clamped to the viewport — card-anchored
+                    // placement kept computing off-screen once the card sat near an edge.
+                    const hostRect = scrollRef.current?.getBoundingClientRect();
+                    if (!hostRect) return null;
+                    const SLIP_PANEL_H = 100;
+                    const panelLeft = Math.min(
+                      Math.max(hostRect.left + hostRect.width / 2 - (W + 16) / 2, 8),
+                      Math.max(8, window.innerWidth - W - 24),
+                    );
+                    const panelTop = Math.max(8, hostRect.top - SLIP_PANEL_H - 6);
+                    const panelPps = W / viewLen;
+                    const tileW = 40;
+                    const tiles = stripTiles(strip, viewStart, viewEnd, Math.max(0.05, tileW / panelPps), panelPps);
+                    // In-flight drags must read the LATEST view (followView/zoom shift it
+                    // mid-gesture), so pointer→seconds mapping goes through the geometry mirror.
+                    const viewNow = () => {
+                      const geom = slipPanelGeomRef.current;
+                      return geom
+                        ? { start: geom.viewStart, len: geom.viewLen, z: geom.zoom }
+                        : { start: viewStart, len: viewLen, z: zoom };
+                    };
+                    const secAtPanel = (clientX: number, box: DOMRect) => {
+                      const v = viewNow();
+                      return v.start + ((clientX - box.left) / W) * v.len;
+                    };
+                    const pxOf = (sec: number) => ((sec - viewStart) / viewLen) * W;
+                    const clampDelta = (deltaSec: number) => Math.min(
+                      Math.max(deltaSec, -span.shot.srcStart),
+                      Math.max(0, dur - span.shot.srcEnd),
+                    );
+                    const applyZoom = (nextZoom: number) => {
+                      const z = Math.min(16, Math.max(1, nextZoom));
+                      const nextLen = dur / z;
+                      const center = (winStart + winEnd) / 2;
+                      setSlipView({
+                        zoom: z,
+                        startSec: Math.min(Math.max(center - nextLen / 2, 0), Math.max(0, dur - nextLen)),
+                      });
+                    };
+                    const followView = (nextStart: number, nextEnd: number) => {
+                      const v = viewNow();
+                      if (v.z <= 1) return;
+                      if (nextStart < v.start) setSlipView({ zoom: v.z, startSec: Math.max(0, nextStart) });
+                      else if (nextEnd > v.start + v.len) {
+                        setSlipView({ zoom: v.z, startSec: Math.min(Math.max(0, dur - v.len), nextEnd - v.len) });
+                      }
+                    };
+                    const startTrimDrag = (e: React.PointerEvent, edge: 'left' | 'right') => {
+                      if (!onResizeShot || e.button !== 0) return;
+                      e.stopPropagation();
+                      const box = (e.currentTarget.parentElement as HTMLElement).getBoundingClientRect();
+                      let latest = edge === 'left' ? span.start : span.end;
+                      drag(e, (clientX) => {
+                        const sec = secAtPanel(clientX, box);
+                        if (edge === 'left') {
+                          const nextSrcStart = Math.min(Math.max(0, sec), span.shot.srcEnd - minSpanSrc);
+                          latest = span.start + (nextSrcStart - span.shot.srcStart) / rate;
+                          followView(nextSrcStart, span.shot.srcEnd);
+                        } else {
+                          const nextSrcEnd = Math.max(Math.min(dur, sec), span.shot.srcStart + minSpanSrc);
+                          latest = span.end + (nextSrcEnd - span.shot.srcEnd) / rate;
+                          followView(span.shot.srcStart, nextSrcEnd);
+                        }
+                        setShotResize({ shotId: span.shot.id, edge, atSec: latest });
+                      }, (moved) => {
+                        setShotResize(null);
+                        if (moved) onResizeShot(span.shot.id, edge, latest);
+                      });
+                    };
+                    return (
+                      <div
+                        ref={slipPanelRef}
+                        className="fixed z-[70] rounded-lg border border-white/10 bg-black/85 p-2 shadow-xl backdrop-blur"
+                        style={{ left: panelLeft, top: panelTop, width: W + 16 }}
+                        onPointerDown={(e) => e.stopPropagation()}
+                      >
+                        <div className="mb-1 flex items-center gap-2 text-[10px] text-white/70">
+                          <span className="shrink-0">{t('panels.slipWindow')}</span>
+                          <span className="min-w-0 flex-1 truncate text-right tabular-nums">
+                            {`${winStart.toFixed(1)}s – ${winEnd.toFixed(1)}s (${(winEnd - winStart).toFixed(1)}s) / ${dur.toFixed(1)}s`}
+                          </span>
+                          <span className="flex shrink-0 items-center gap-1.5">
+                            <button
+                              type="button"
+                              aria-label="−"
+                              className="h-4 w-4 rounded bg-white/10 leading-none hover:bg-white/20"
+                              onClick={() => applyZoom(zoom / 1.25)}
+                            >
+                              −
+                            </button>
+                            <input
+                              type="range"
+                              min={1}
+                              max={16}
+                              step={0.1}
+                              value={zoom}
+                              onChange={(e) => applyZoom(Number(e.target.value))}
+                              className="zoom-range w-24"
+                              aria-label={t('panels.slipWindow')}
+                            />
+                            <button
+                              type="button"
+                              aria-label="+"
+                              className="h-4 w-4 rounded bg-white/10 leading-none hover:bg-white/20"
+                              onClick={() => applyZoom(zoom * 1.25)}
+                            >
+                              +
+                            </button>
+                          </span>
+                          <button
+                            type="button"
+                            aria-label={t('workbench.close')}
+                            className="shrink-0 text-white/60 hover:text-white"
+                            onClick={() => setSlipPanel(null)}
+                          >
+                            ✕
+                          </button>
+                        </div>
+                        <div className="relative" style={{ width: W }}>
+                        <div
+                          ref={slipStripRef}
+                          className="relative h-14 cursor-crosshair overflow-hidden rounded bg-white/5"
+                          style={{ width: W, touchAction: 'none' }}
+                          onPointerDown={(e) => {
+                            const box = e.currentTarget.getBoundingClientRect();
+                            // Pressing INSIDE the window drags it relatively (no recentering
+                            // jump); pressing outside jumps the window centre to the press.
+                            const pressSec = secAtPanel(e.clientX, box);
+                            const winStartNow = span.shot.srcStart
+                              + (shotSlipRef.current?.shotId === span.shot.id ? shotSlipRef.current.deltaSec : 0);
+                            const grabOffset = pressSec >= winStartNow && pressSec <= winStartNow + winLen0
+                              ? pressSec - winStartNow
+                              : winLen0 / 2;
+                            const apply = (clientX: number) => {
+                              const sec = secAtPanel(clientX, box);
+                              const deltaSec = clampDelta(sec - grabOffset - span.shot.srcStart);
+                              const next = { shotId: span.shot.id, deltaSec };
+                              shotSlipRef.current = next;
+                              setShotSlip(next);
+                              followView(span.shot.srcStart + deltaSec, span.shot.srcEnd + deltaSec);
+                            };
+                            apply(e.clientX);
+                            drag(e, (clientX) => apply(clientX), () => {
+                              const current = shotSlipRef.current;
+                              setShotSlip(null);
+                              if (current?.shotId === span.shot.id && Math.abs(current.deltaSec) > 0.001) {
+                                onSlipShot(span.shot.id, current.deltaSec);
+                              }
+                            });
+                          }}
+                        >
+                          {tiles.length ? tiles.map((tile, k) => (
+                            <img key={k} src={tile.url} alt="" draggable={false} className="absolute top-0 h-full object-cover" style={{ left: tile.left, width: tileW + 1 }} />
+                          )) : <div className="absolute inset-0 bg-gradient-to-r from-sky-500/25 to-sky-500/10" />}
+                          <div className="pointer-events-none absolute inset-y-0 left-0 bg-black/50" style={{ width: Math.min(W, Math.max(0, pxOf(winStart))) }} />
+                          <div className="pointer-events-none absolute inset-y-0 right-0 bg-black/50" style={{ width: Math.min(W, Math.max(0, W - pxOf(winEnd))) }} />
+                          <div className="ring-accent absolute inset-y-0 cursor-grab rounded ring-2 active:cursor-grabbing" style={{ left: pxOf(winStart), width: Math.max(6, pxOf(winEnd) - pxOf(winStart)) }} />
+                        </div>
+                        {/* Trim handles live OUTSIDE the strip's overflow-hidden so a window at the
+                            view edge keeps them grabbable (they may overhang the strip by 3px);
+                            an endpoint scrolled out of the zoomed view hides its handle. */}
+                        {onResizeShot ? (
+                          <>
+                            {pxOf(winStart) >= -4 && pxOf(winStart) <= W + 4 ? (
+                              <div
+                                role="none"
+                                onPointerDown={(e) => startTrimDrag(e, 'left')}
+                                className="bg-accent absolute inset-y-0 z-10 w-1.5 cursor-ew-resize rounded-full opacity-80 hover:opacity-100"
+                                style={{ left: pxOf(winStart) - 3 }}
+                              />
+                            ) : null}
+                            {pxOf(winEnd) >= -4 && pxOf(winEnd) <= W + 4 ? (
+                              <div
+                                role="none"
+                                onPointerDown={(e) => startTrimDrag(e, 'right')}
+                                className="bg-accent absolute inset-y-0 z-10 w-1.5 cursor-ew-resize rounded-full opacity-80 hover:opacity-100"
+                                style={{ left: pxOf(winEnd) - 3 }}
+                              />
+                            ) : null}
+                          </>
+                        ) : null}
+                        </div>
+                      </div>
+                    );
+                  })() : null}
                   {/* Cut-point transition (content-level, mounted on the main track): unset = narrow "add" affordance; set = a
                       symmetric region centered on the cut (theme color), with handles on both sides dragging the duration symmetrically (drag one, the other mirrors; total <=4s).
                       z-30 is above scene cards, below the hover "+" (z-40) */}
@@ -1833,8 +2457,8 @@ function StudioTimelineImpl({
                                 e.stopPropagation();
                                 onOpenTransition(end, e.currentTarget.getBoundingClientRect());
                               }}
-                              className={`absolute top-3 bottom-2 z-30 flex w-3.5 -translate-x-1/2 cursor-pointer items-center justify-center bg-black/40 text-white/75 transition hover:bg-black/65 hover:text-white ${TIMELINE_ITEM_RADIUS}`}
-                              style={{ left: x(end) }}
+                              className="absolute z-30 flex h-5 w-5 -translate-x-1/2 cursor-pointer items-center justify-center rounded-full bg-black/55 text-white/75 shadow-sm transition hover:bg-black/75 hover:text-white"
+                              style={{ left: x(end), top: SCENE_PAD_T + 3 }}
                             >
                               <ArrowLeftRight size={10} />
                             </button>
@@ -1861,14 +2485,15 @@ function StudioTimelineImpl({
                                 },
                               );
                             }}
-                            className="bg-accent absolute top-0 bottom-0 w-1.5 cursor-ew-resize rounded-full opacity-80 hover:opacity-100"
+                            className="bg-accent pointer-events-auto absolute top-0 bottom-0 w-1.5 cursor-ew-resize rounded-full opacity-80 hover:opacity-100"
                             style={side < 0 ? { left: -3 } : { right: -3 }}
                           />
                         );
                         return (
                           <div
                             key={`tr-${i}`}
-                            className="absolute top-3 bottom-2 z-30"
+                            data-transition-region
+                            className="pointer-events-none absolute top-3 bottom-2 z-30"
                             style={{ left: x(end - half), width: Math.max(10, x(half * 2)) }}
                             onMouseEnter={(e) => {
                               if (draggingRef.current) return; // don't grab hover-scrub while dragging
@@ -1887,9 +2512,9 @@ function StudioTimelineImpl({
                                 e.stopPropagation();
                                 onOpenTransition(end, e.currentTarget.getBoundingClientRect());
                               }}
-                              className={`bg-accent/30 ring-accent/70 hover:bg-accent/40 absolute inset-0 flex cursor-pointer items-center justify-center ring-1 transition ${TIMELINE_ITEM_RADIUS}`}
+                              className={`bg-accent/30 ring-accent/70 pointer-events-none absolute inset-0 ring-1 ${TIMELINE_ITEM_RADIUS}`}
                             >
-                              <span className="bg-accent flex h-4 w-4 items-center justify-center rounded-full text-white shadow">
+                              <span className="bg-accent pointer-events-auto absolute left-1/2 top-1/2 flex h-5 w-5 -translate-x-1/2 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full text-white shadow transition hover:brightness-110">
                                 <ArrowLeftRight size={9} />
                               </span>
                             </button>
@@ -1986,6 +2611,7 @@ function StudioTimelineImpl({
                           clip.startSec,
                           visibleRange.startSec,
                           visibleRange.endSec,
+                          clip.endSec,
                         ).map((tile, index) => (
                           <img
                             key={index}
@@ -1993,7 +2619,7 @@ function StudioTimelineImpl({
                             alt=""
                             draggable={false}
                             className="absolute top-0 max-w-none object-cover"
-                            style={{ left: tile.left, width: visualThumbW, height: visualFilmH }}
+                            style={{ left: tile.left, width: tile.width, height: visualFilmH }}
                           />
                         )) : (
                           <div className="absolute inset-0 bg-gradient-to-r from-accent/20 to-accent/8" />
@@ -2148,11 +2774,14 @@ function StudioTimelineImpl({
                 const k = blockKind(b);
                 const meta = { ...KIND_META[k], ...KIND_CHIP[k] };
                 const Icon = meta.icon;
-                const left = x(btd?.startSec ?? b.startSec);
-                const width = Math.max(16, x(b.durationSec));
+                const displayStartSec = btd?.startSec ?? b.startSec;
+                const displayDurationSec = Math.max(0, Math.min(b.durationSec, dur - displayStartSec));
+                const left = x(displayStartSec);
+                const width = Math.max(16, x(displayDurationSec));
                 // Sentence captions don't enter the timeline: captions are a pure computed output of the script (edited from the script panel / caption panel);
                 // a row of chips that follow the transcript and can't be dragged or trimmed is just noise
                 if (isSentenceCaption(b)) return null;
+                if (displayDurationSec <= 0) return null;
                 // During cross-track drag the chip follows an exact physical lane identity. stackOrder
                 // is render z only and cannot identify a lane when two imported tracks share a value.
                 const crossing = !!btd && (btd.gap != null || btd.to !== track);
@@ -2297,7 +2926,9 @@ function StudioTimelineImpl({
                 captionBlocks.map((b) => {
                   const preview = captionResize?.id === b.id ? captionResize : b;
                   const selected = selectedBlockIds.has(b.id);
-                  const width = Math.max(10, x(preview.durationSec));
+                  const displayDurationSec = Math.max(0, Math.min(preview.durationSec, dur - preview.startSec));
+                  if (displayDurationSec <= 0) return null;
+                  const width = Math.max(10, x(displayDurationSec));
                   const precisionControls = width >= 18;
                   const end = b.startSec + b.durationSec;
                   const minDurationSec = 1 / Math.max(1, framePickFps);

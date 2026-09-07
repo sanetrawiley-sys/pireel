@@ -30,6 +30,7 @@ import type { VisualTimeline } from './visual';
 import type { StudioElementRef } from './studio-chat';
 import { agentElementRosterKey, buildAgentElementRoster } from './agent-element-roster';
 import { blockDisplayTitle } from './block-display-title';
+import { loadCurrentUserBalance } from './current-user';
 import { t } from './i18n';
 
 export interface AgentContextDeps {
@@ -74,10 +75,9 @@ export function useAgentContext(deps: AgentContextDeps) {
     let gone = false;
     const refresh = () => {
       if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-      fetch('/api/me/balance')
-        .then((r) => (r.ok ? r.json() : null))
-        .then((j: { balance?: number } | null) => {
-          if (!gone && j && typeof j.balance === 'number') canGenerateRef.current = j.balance > 0;
+      loadCurrentUserBalance()
+        .then((balance) => {
+          if (!gone && balance) canGenerateRef.current = balance.balance > 0;
         })
         .catch(() => {});
     };
@@ -259,7 +259,10 @@ export function useAgentContext(deps: AgentContextDeps) {
       clipAsrFailRef.current.add(src);
       toast.error(t('workbench.bRollTranscriptionFailed'));
     };
-    const srcs = [...new Set((compRef.current.shots ?? []).filter((s) => s.src).map((s) => s.src!))];
+    // Muted inserted sources are outside the mix: captions, translation and spoken-word addressing
+    // never derive from them, so bulk transcription skips them — a fully muted montage lane must
+    // not relaunch one ASR per source on every captions-panel action or read_script call.
+    const srcs = [...new Set((compRef.current.shots ?? []).filter((s) => s.src && !s.audioMuted).map((s) => s.src!))];
     for (const src of srcs) {
       if (clipAsrRef.current[src] || clipAsrFailRef.current.has(src)) continue;
       if (clipAsrBusyRef.current.has(src)) {

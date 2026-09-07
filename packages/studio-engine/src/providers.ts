@@ -19,6 +19,8 @@ import type { CustomVisualStyle } from './visual-style';
 
 /** One block-generation request (the same shape the BYO brief is assembled from). */
 export interface ComposeRequest {
+  /** Billing attribution only — which project this generation belongs to. */
+  projectId?: string;
   block: BlockEdit;
   instruction: string;
   theme?: string;
@@ -42,7 +44,8 @@ export interface BlockComposer {
 
 /** Speech → timed sentences (source-clock seconds). */
 export interface Transcriber {
-  transcribe(file: File): Promise<AsrSegment[]>;
+  /** opts.projectId is billing attribution only. */
+  transcribe(file: File, opts?: { projectId?: string }): Promise<AsrSegment[]>;
 }
 
 /** Source-video byte vault (content-addressed by signature). Null results = degrade to local-only. */
@@ -56,6 +59,10 @@ export interface ProjectStore {
   load(id: string): Promise<StudioProjectDto | null>;
   save(id: string, payload: ProjectSavePayload): Promise<'ok' | 'conflict' | 'migration-required' | 'skip'>;
   remove(id: string): Promise<void>;
+  /** Project-card cover as image BYTES (null clears). Kept out of the JSON save payload:
+   * a base64 cover multiplies every project PUT/GET/list response. Optional — a shell
+   * without object storage simply keeps covers device-local. */
+  saveCover?(id: string, cover: Blob | null): Promise<void>;
 }
 
 /** Server-authoritative Studio chat sessions. Browser storage is not part of this contract. */
@@ -116,6 +123,9 @@ export interface StudioProviders {
   curatedAssets?: CuratedAssetProvider;
   /** Endpoint for the built-in agent chat (a hosted-LLM feature; OSS shells may omit and rely on external agents via MCP). */
   chatEndpoint?: string;
+  /** Which agent tool surface the host's chat route speaks. Resolved once per session so the client can
+   *  route tool calls (`v3` names execute through the v3 adapter). Absent = legacy. */
+  agentSurface?: () => Promise<'legacy' | 'v3'>;
   /** Cloud undo fallback: pop the newest entry off the project's server-side history ring and
    *  return the restored V2 document (null = ring empty). Absent = in-memory undo only (OSS shell).
    *  The server marks the restore as consumed — repeated calls walk strictly backward. */

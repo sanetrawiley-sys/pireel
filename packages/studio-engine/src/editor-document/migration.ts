@@ -315,6 +315,7 @@ export function migrateLegacyProjectToV2(input: LegacyProjectForMigration): Edit
         startSec: _startSec,
         inSec: _inSec,
         outSec: _outSec,
+        role: _role,
         ...properties
       } = audio;
       return {
@@ -338,7 +339,7 @@ export function migrateLegacyProjectToV2(input: LegacyProjectForMigration): Edit
       muted: false,
       hidden: false,
       locked: false,
-      // Legacy edits had no persisted sync-lock flag. Migrate to the NLE/Palmier default so
+      // Legacy edits had no persisted sync-lock flag. Migrate to the professional-NLE default so
       // narration ripple cuts keep existing audio cues aligned; users may opt a music lane out later.
       syncLocked: true,
       stackOrder: 0,

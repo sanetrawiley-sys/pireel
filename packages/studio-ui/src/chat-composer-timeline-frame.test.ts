@@ -5,6 +5,7 @@ import { createRoot } from 'react-dom/client';
 import { IntlProvider } from 'use-intl/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { STUDIO_AUTO_SKILL_ID } from '@pireel/studio-engine/scenario-skills';
+import { STUDIO_CREATE_SKILL_ACTION } from '@pireel/studio-engine/skill-actions';
 import { Composer, type ComposerHandle } from './chat-composer';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -59,6 +60,96 @@ function renderComposer(
 }
 
 describe('Composer timeline-frame tags', () => {
+  it('fills and safely replaces an untouched Skill prompt without auto-submitting', () => {
+    const { host, methodsRef, onSubmit } = renderComposer();
+    const editor = host.querySelector<HTMLElement>('[contenteditable="true"]')!;
+
+    act(() => methodsRef.current!.applySkillPrompt('先用当前素材剪一条大女主短片。'));
+    expect(editor.textContent?.trim()).toBe('先用当前素材剪一条大女主短片。');
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    act(() => methodsRef.current!.applySkillPrompt('改成一条产品故事短片。'));
+    expect(editor.textContent?.trim()).toBe('改成一条产品故事短片。');
+
+    act(() => methodsRef.current!.applySkillPrompt(null));
+    expect(editor.textContent).toBe('');
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it('does not overwrite text the user changed after a Skill prompt was filled', () => {
+    const { host, methodsRef } = renderComposer();
+    const editor = host.querySelector<HTMLElement>('[contenteditable="true"]')!;
+
+    act(() => methodsRef.current!.applySkillPrompt('先剪一条短片。'));
+    act(() => {
+      editor.textContent = '先剪一条短片，但只用酒店素材。';
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    });
+    act(() => methodsRef.current!.applySkillPrompt('换成另一种剪法。'));
+
+    expect(editor.textContent).toBe('先剪一条短片，但只用酒店素材。');
+  });
+
+  it('keeps the automatic canvas-selection pill when filling a Skill prompt', () => {
+    const element = {
+      id: 'shot-a',
+      label: '镜头 A',
+      kind: 'shot',
+      isShot: true,
+    };
+    const { host, methodsRef } = renderComposer([element]);
+    const editor = host.querySelector<HTMLElement>('[contenteditable="true"]')!;
+
+    act(() => methodsRef.current!.insertElementPill(element));
+    act(() => methodsRef.current!.applySkillPrompt('优化这个镜头并完成整条短片。'));
+
+    expect(editor.querySelector('[data-ref-id="shot-a"][data-auto]')).not.toBeNull();
+    expect(editor.textContent).toContain('优化这个镜头并完成整条短片。');
+  });
+
+  it('enters Create Skill as an editable tag and waits for manual submit', async () => {
+    const { host, methodsRef, onSubmit } = renderComposer();
+    const editor = host.querySelector<HTMLElement>('[contenteditable="true"]')!;
+
+    act(() => methodsRef.current!.beginCreateSkill({
+      label: '创建 Skill',
+      prompt: '提炼这次对话，保留关键判断。',
+    }));
+
+    const tag = editor.querySelector<HTMLElement>('[data-studio-action="create-skill"]')!;
+    expect(tag).not.toBeNull();
+    expect(tag.classList).toContain('sc-pill');
+    expect(tag.classList).toContain('bg-accent/5');
+    expect(tag.classList).not.toContain('bg-ink');
+    expect(editor.textContent).toContain('提炼这次对话，保留关键判断。');
+    expect(onSubmit).not.toHaveBeenCalled();
+
+    await act(async () => {
+      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+
+    expect(onSubmit).toHaveBeenCalledWith(
+      [{ type: 'text', text: '提炼这次对话，保留关键判断。' }],
+      { studioAction: STUDIO_CREATE_SKILL_ACTION },
+    );
+  });
+
+  it('keeps Create Skill active for follow-up answers until explicitly cleared', async () => {
+    const { host, methodsRef, onSubmit } = renderComposer();
+    onSubmit.mockResolvedValue(true);
+    const editor = host.querySelector<HTMLElement>('[contenteditable="true"]')!;
+    act(() => methodsRef.current!.beginCreateSkill({ label: '创建 Skill', prompt: '先生成草稿。' }));
+
+    await act(async () => {
+      editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    expect(editor.querySelector('[data-studio-action="create-skill"]')).not.toBeNull();
+    expect(editor.textContent).toBe('✦创建 Skill ');
+
+    act(() => methodsRef.current!.clearStudioAction());
+    expect(editor.querySelector('[data-studio-action]')).toBeNull();
+  });
+
   it('inserts an @ mention where the trigger was typed in the middle of text', () => {
     vi.useFakeTimers();
     const { host } = renderComposer([

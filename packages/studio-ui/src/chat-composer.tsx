@@ -6,6 +6,10 @@ import { useImperativeHandle, useRef, useState } from "react";
 import { AtSign, ArrowUp, Square, Palette } from "lucide-react";
 import type { ChatStatus } from "ai";
 import {
+  STUDIO_CREATE_SKILL_ACTION,
+  type StudioMetaAction,
+} from "@pireel/studio-engine/skill-actions";
+import {
   TriggerPopover,
   type TriggerPopoverHandle,
   type TriggerPopoverPickContext,
@@ -15,6 +19,7 @@ import { ChatSkillPicker } from "./chat-skill-picker";
 import type { FrameCatalogItem } from "./use-frame-catalog";
 import {
   appendChatPillRemoveIcon,
+  CHAT_ACTION_PILL_CLASS,
   CHAT_PILL_CLASS,
   CHAT_PILL_ICON_CLASS,
   CHAT_PILL_LABEL_CLASS,
@@ -51,6 +56,12 @@ export interface ComposerHandle {
   insertText(text: string): void;
   /** Replace the whole box with text and focus (used by quick prompts): tapping different prompts swaps, doesn't concatenate. */
   setText(text: string): void;
+  /** Apply a Skill's suggested first message without overwriting user-authored draft content. */
+  applySkillPrompt(prompt: string | null): void;
+  /** Enter the host-owned Create Skill mode without sending; the user reviews/edits and submits. */
+  beginCreateSkill(input: { label: string; prompt: string }): void;
+  /** Leave the active Meta Skill mode, preserving any ordinary text the user typed. */
+  clearStudioAction(): void;
   /** Focus only (cursor to end), don't touch content (used by the component floating bar's "AI edit"). */
   focusInput(): void;
   beginTimelineFrameCapture(frame: PendingTimelineFrame): void;
@@ -64,7 +75,8 @@ export function Composer({
   elements,
   skillId,
   scenarioSkills,
-  onImportScenarioSkill,
+  onOpenSkillMarket,
+  onCreateScenarioSkill,
   onDeleteScenarioSkill,
   onPickSkill,
   frame,
@@ -85,7 +97,8 @@ export function Composer({
   skillId: StudioScenarioSkillId;
   /** Browser-safe host catalog; full Markdown never enters this component. */
   scenarioSkills: readonly StudioScenarioSkillOption[];
-  onImportScenarioSkill?: (file: File) => Promise<StudioScenarioSkillOption>;
+  onOpenSkillMarket?: () => void;
+  onCreateScenarioSkill?: () => void;
   onDeleteScenarioSkill?: (id: string) => Promise<void>;
   onPickSkill: (id: StudioScenarioSkillId) => void;
   /** Visual direction attached to the current session. */
@@ -97,26 +110,34 @@ export function Composer({
   timelineFramePickBusy: boolean;
   timelineFramePickAvailable: boolean;
   onTimelineFramePickActiveChange?: StudioChatProps["onTimelineFramePickActiveChange"];
-  onSubmit: (parts: StudioChatDraftPart[]) => void;
+  onSubmit: (
+    parts: StudioChatDraftPart[],
+    options?: { studioAction?: StudioMetaAction },
+  ) => boolean | Promise<boolean>;
   onStop: () => void;
   methodsRef: React.MutableRefObject<ComposerHandle | null>;
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
   const refPopoverRef = useRef<TriggerPopoverHandle>(null);
   const savedSelectionRef = useRef<Range | null>(null);
+  const suggestedSkillPromptRef = useRef<string | null>(null);
   const timelineFramesRef = useRef<Map<string, AttachedTimelineFrame | null>>(
     new Map(),
   );
   const [empty, setEmpty] = useState(true);
   const [timelineFrameCount, setTimelineFrameCount] = useState(0);
+  const [studioActionActive, setStudioActionActive] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
   const [customStyle, saveCustomStyle] = useCustomFrameStyle();
-  const isBusy = status === "streaming" || status === "submitted";
+  const isBusy = submitting || status === "streaming" || status === "submitted";
 
   function recomputeEmpty() {
     const el = editorRef.current;
     if (!el) return;
-    const isEmpty = (el.textContent ?? "").length === 0;
+    const visibleDraft = el.cloneNode(true) as HTMLElement;
+    visibleDraft.querySelectorAll("[data-studio-action]").forEach((node) => node.remove());
+    const isEmpty = (visibleDraft.textContent ?? "").length === 0;
     if (
       isEmpty &&
       (el.innerHTML === "<br>" || el.innerHTML === "<div><br></div>")
@@ -151,6 +172,7 @@ export function Composer({
         return;
       }
       if (!(node instanceof HTMLElement)) return;
+      if (node.dataset.studioAction) return;
       if (node.dataset.timelineFrameId) {
         const timelineFrame = timelineFramesRef.current.get(
           node.dataset.timelineFrameId,
@@ -209,17 +231,68 @@ export function Composer({
   function clear() {
     const el = editorRef.current;
     if (el) {
-      el.innerHTML = "";
+      const actionPill = el.querySelector<HTMLElement>("[data-studio-action]");
+      if (actionPill) {
+        actionPill.remove();
+        el.replaceChildren(actionPill, document.createTextNode(" "));
+      } else {
+        el.innerHTML = "";
+      }
       el.focus();
     }
     timelineFramesRef.current.clear();
     hideTimelineFrameHoverPreview();
     savedSelectionRef.current = null;
+    suggestedSkillPromptRef.current = null;
     setTimelineFrameCount(0);
     setEmpty(true);
   }
 
-  function fireSubmit() {
+  function replaceEditorText(text: string) {
+    const root = editorRef.current;
+    if (!root) return;
+    root.replaceChildren();
+    if (text) root.appendChild(document.createTextNode(`${text} `));
+    focusEditorAtEnd(root);
+  }
+
+  function focusEditorAtEnd(root: HTMLElement) {
+    recomputeEmpty();
+    root.focus();
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(root);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    savedSelectionRef.current = range.cloneRange();
+  }
+
+  function ordinaryDraftText(root: HTMLElement): string {
+    const draft = root.cloneNode(true) as HTMLElement;
+    draft
+      .querySelectorAll("[data-ref-id], [data-timeline-frame-id], [data-studio-action]")
+      .forEach((node) => node.remove());
+    return (draft.textContent ?? "").trim();
+  }
+
+  function replaceSuggestedSkillPrompt(root: HTMLElement, text: string) {
+    // The workbench may have inserted one automatic current-selection pill. It is
+    // context, not user-authored copy, so keep it while replacing only the suggestion.
+    const automaticPills = Array.from(
+      root.querySelectorAll<HTMLElement>("[data-ref-id][data-auto]"),
+    );
+    root.replaceChildren();
+    for (const pill of automaticPills) {
+      root.appendChild(pill);
+      root.appendChild(document.createTextNode(" "));
+    }
+    if (text) root.appendChild(document.createTextNode(`${text} `));
+    focusEditorAtEnd(root);
+  }
+
+  async function fireSubmit() {
     if (isBusy) return;
     if (hasLoadingTimelineFrame()) {
       return;
@@ -243,8 +316,16 @@ export function Composer({
       (part) => part.type !== "text" || part.text.length > 0,
     );
     if (!final.length) return;
-    onSubmit(final);
-    clear();
+    const studioAction = currentStudioAction();
+    setSubmitting(true);
+    try {
+      const accepted = studioAction
+        ? await onSubmit(final, { studioAction })
+        : await onSubmit(final);
+      if (accepted) clear();
+    } finally {
+      setSubmitting(false);
+    }
   }
 
   /** Remove a trigger and its live filter text (`/口播`) after a command-menu selection. */
@@ -356,6 +437,40 @@ export function Composer({
     recomputeEmpty();
   }
 
+  function currentStudioAction(): StudioMetaAction | null {
+    return editorRef.current?.querySelector(
+      `[data-studio-action="${STUDIO_CREATE_SKILL_ACTION}"]`,
+    )
+      ? STUDIO_CREATE_SKILL_ACTION
+      : null;
+  }
+
+  function clearStudioAction() {
+    const pill = editorRef.current?.querySelector<HTMLElement>("[data-studio-action]");
+    if (pill) removePillNode(pill);
+    setStudioActionActive(false);
+  }
+
+  function makeStudioActionPill(label: string): HTMLSpanElement {
+    const pill = document.createElement("span");
+    pill.contentEditable = "false";
+    pill.dataset.studioAction = STUDIO_CREATE_SKILL_ACTION;
+    pill.className = CHAT_ACTION_PILL_CLASS;
+    pill.title = label;
+
+    const icon = document.createElement("span");
+    icon.className = `${CHAT_PILL_ICON_CLASS} text-accent`;
+    icon.textContent = "✦";
+    pill.appendChild(icon);
+
+    const text = document.createElement("span");
+    text.className = CHAT_PILL_LABEL_CLASS;
+    text.textContent = label;
+    pill.appendChild(text);
+    appendChatPillRemoveIcon(pill, t("chatGen.skill.create.remove"), clearStudioAction);
+    return pill;
+  }
+
   function makeEditableElementPill(el: StudioElementRef, auto = false) {
     const pill = makeElementPill(el, {
       auto,
@@ -451,21 +566,49 @@ export function Composer({
         recomputeEmpty();
       },
       setText: (text: string) => {
+        suggestedSkillPromptRef.current = null;
+        replaceEditorText(text);
+      },
+      applySkillPrompt: (prompt: string | null) => {
+        const root = editorRef.current;
+        if (!root) return;
+        const currentText = ordinaryDraftText(root);
+        const previousPrompt = suggestedSkillPromptRef.current;
+        const hasStructuredDraft = !!root.querySelector(
+          "[data-ref-id]:not([data-auto]), [data-timeline-frame-id], [data-studio-action]",
+        );
+        const canReplace =
+          !hasStructuredDraft &&
+          (!currentText || (!!previousPrompt && currentText === previousPrompt));
+        if (!canReplace) {
+          suggestedSkillPromptRef.current = null;
+          return;
+        }
+        const nextPrompt = prompt?.trim() || "";
+        suggestedSkillPromptRef.current = nextPrompt || null;
+        replaceSuggestedSkillPrompt(root, nextPrompt);
+      },
+      beginCreateSkill: ({ label, prompt }) => {
         const root = editorRef.current;
         if (!root) return;
         root.innerHTML = "";
-        root.appendChild(document.createTextNode(`${text} `));
+        suggestedSkillPromptRef.current = null;
+        root.appendChild(makeStudioActionPill(label));
+        root.appendChild(document.createTextNode(` ${prompt} `));
+        setStudioActionActive(true);
         recomputeEmpty();
         root.focus();
-        const sel = window.getSelection();
-        if (sel) {
+        const selection = window.getSelection();
+        if (selection) {
           const range = document.createRange();
           range.selectNodeContents(root);
           range.collapse(false);
-          sel.removeAllRanges();
-          sel.addRange(range);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          savedSelectionRef.current = range.cloneRange();
         }
       },
+      clearStudioAction,
       insertText: (text: string) => {
         const root = editorRef.current;
         if (!root) return;
@@ -538,14 +681,14 @@ export function Composer({
       return;
     }
     e.preventDefault();
-    fireSubmit();
+    void fireSubmit();
   }
 
   return (
     <>
       <div className="border-line bg-panel-2 focus-within:border-ink-4 relative rounded-md border transition-colors">
         <div className="relative">
-          {empty && (
+          {empty && !studioActionActive && (
             <div className="text-ink-4 pointer-events-none absolute left-3 top-2.5 text-[13px]">
               {placeholder}
             </div>
@@ -621,7 +764,8 @@ export function Composer({
               editorRef={editorRef}
               skillId={skillId}
               skills={scenarioSkills}
-              onImportMarkdown={onImportScenarioSkill}
+              onOpenSkillMarket={onOpenSkillMarket}
+              onCreateSkill={onCreateScenarioSkill}
               onDeleteCustom={onDeleteScenarioSkill}
               disabled={isBusy}
               onChange={onPickSkill}
@@ -645,7 +789,7 @@ export function Composer({
               type="button"
               className="bg-ink text-bg inline-flex h-7 w-7 items-center justify-center rounded-md transition-opacity hover:opacity-85 disabled:pointer-events-none disabled:opacity-25"
               disabled={empty || timelineFramePickBusy}
-              onClick={fireSubmit}
+              onClick={() => void fireSubmit()}
               title={t("chatGen.sendEnter")}
             >
               <ArrowUp className="h-4 w-4" strokeWidth={2.5} />

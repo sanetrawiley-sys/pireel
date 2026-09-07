@@ -25,6 +25,7 @@ export const CAPTIONS_EN: Record<string, string> = {
   'captions.retranslateLine': 'Retranslate this line',
   'captions.relayout': 'Re-layout captions',
   'captions.relayoutHint': 'Regenerate cue boundaries for the current canvas and font size (undoable)',
+  'captions.relayoutDone': 'Captions re-laid out for the current canvas',
   'captions.styles': 'Styles',
   'captions.transcribeFirst': 'Transcribe first',
   'captions.translateTranscriptIntoLang': 'Translate the transcript into {lang} as a second caption line',
@@ -44,5 +45,7 @@ export const CAPTIONS_EN: Record<string, string> = {
   'captions.off': 'Off',
   'captions.fontSize': 'Font size',
   'captions.bold': 'Bold',
+  'captions.fontFamily': 'Font',
+  'captions.moreStyle': 'More style',
   'captions.enableCaptions': 'Turn on captions',
 };

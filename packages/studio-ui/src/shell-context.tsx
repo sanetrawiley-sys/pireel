@@ -22,16 +22,34 @@ export interface ShellQualityConfig {
 }
 
 /** Browser-safe catalog metadata. Full Skill Markdown stays in the host's server bundle. */
+export interface StudioSkillMarketMetadata {
+  /** Stable market identity; versions change without changing this id. */
+  listingId: string;
+  source: 'official' | 'owned' | 'market';
+  /** Public/publish-form description. Never contains the Markdown playbook body. */
+  description: string;
+  publisherName?: string | null;
+  version: string | number;
+  versionId?: string;
+  visibility: 'official' | 'private' | 'unlisted' | 'public';
+  publishedAt?: number | null;
+  updatedAt?: number | null;
+}
+
 export interface StudioScenarioSkillOption {
   id: string;
   title: string;
   summary: string;
+  /** Editable first message filled into an empty composer when this Skill is selected. */
+  defaultPrompt?: string | null;
   /** Compact picker mark; presentation only, never included in the model prompt. */
   icon?: string;
   /** Optional editable opening prompts shown in an empty chat. Picking one activates this Skill. */
   starters?: readonly StudioScenarioSkillStarter[];
   /** User-owned account Skill. Enables management controls; never changes prompt authority. */
   custom?: boolean;
+  /** Market listing metadata used by the picker detail view. Markdown is intentionally absent. */
+  market?: StudioSkillMarketMetadata;
 }
 
 export interface StudioScenarioSkillStarter {
@@ -43,7 +61,7 @@ export interface StudioScenarioSkillStarter {
 
 export interface StudioCustomScenarioSkillManager {
   list(): Promise<readonly StudioScenarioSkillOption[]>;
-  importMarkdown(file: File): Promise<StudioScenarioSkillOption>;
+  openMarket(): void;
   delete(id: string): Promise<void>;
 }
 
@@ -75,7 +93,7 @@ export interface StudioShell {
   };
   /** Host-owned expert catalog. Omitted means the editor runs with no selectable Skill. */
   scenarioSkills?: readonly StudioScenarioSkillOption[];
-  /** Optional host-owned persistence for account-scoped Markdown Skills. */
+  /** Optional host-owned persistence and market navigation for account-scoped Skills. */
   customScenarioSkills?: StudioCustomScenarioSkillManager;
   /** Initial Skill for a fresh hosted conversation; omit to start without a Skill. */
   defaultScenarioSkillId?: string;

@@ -52,6 +52,7 @@ import {
   Captions,
   Power,
   Magnet,
+  Type,
 } from "lucide-react";
 import {
   Tooltip,
@@ -84,6 +85,7 @@ import {
   STUDIO_FONTS_HREF,
   CAPTION_PRESETS,
   applyEditorCommand,
+  runAgentTimelineTool,
   applyCanvasDocumentEdit,
   applyCaptionDocumentEdit,
   resizeManagedCaptionTiming,
@@ -146,6 +148,8 @@ import {
   mediaFramingTransformVars,
   normalizeAtomicMediaFraming,
   resolveShotMediaFraming,
+  resizeNarrativeTimelineClip,
+  slipNarrativeTimelineClip,
   resizeVisualTimelineClip,
   supplementalVisualStateAt,
   DIRECTIONAL_TRANSITIONS,
@@ -160,7 +164,24 @@ import {
   treatmentVacancyBox,
   type MediaTimelineClip,
   canvasSizeFollowingFirstVideo,
+  type DisplayTextAnimationId,
+  type DisplayTextPresetId,
+  displayTextPreset,
+  titleBlock,
 } from "@pireel/studio-engine/composition";
+
+/** Constant speed of a placed video clip = source seconds per timeline second (1 = natural). */
+function clipSpeedInDocument(document: EditorDocumentV2, clipId: string): number {
+  for (const track of document.timeline.tracks) {
+    for (const clip of track.clips) {
+      if (clip.id !== clipId || (clip.kind !== "narrative" && clip.kind !== "media")) continue;
+      const timelineSec = clip.durationFrames / document.canvas.fps;
+      const sourceSec = clip.sourceOutSec - clip.sourceInSec;
+      return timelineSec > 1e-9 && sourceSec > 0 ? Math.round((sourceSec / timelineSec) * 100) / 100 : 1;
+    }
+  }
+  return 1;
+}
 import { getTheme, themeVarsCss } from "@pireel/studio-engine/theme";
 import {
   restoreSrcRange,
@@ -174,6 +195,7 @@ import {
 import {
   type ComposeMode,
   type ComposedBlock,
+  GeneratedBlockValidationError,
   composedBlockFields,
   kitChoiceOf,
 } from "./compose-result";
@@ -194,6 +216,7 @@ import {
 } from "@pireel/studio-engine/graphics-layout";
 import {
   type FilmstripFrame,
+  type FilmstripSourceRange,
   durableFileSig,
   extractFilmstrip,
   fileSig,
@@ -240,6 +263,8 @@ import {
   CloudProjectSaveQueue,
   DeferredEffectDisposer,
 } from "./cloud-project-save";
+import { DeferredActivation } from "./deferred-activation";
+import { loadCurrentUser } from "./current-user";
 import {
   StudioTimeline,
   DEFAULT_PPS,
@@ -289,6 +314,7 @@ import {
   type ExportRenderOpts,
   captureCompositionFrame,
 } from "./client-export";
+import { DisplayTextPanel, type DisplayTextPatch } from "./display-text-panel";
 import {
   Dialog,
   DialogContent,
@@ -379,6 +405,12 @@ import {
   runStudioTool as runAgentStudioTool,
   runExternalTool as runAgentExternalTool,
 } from "./agent-tool-runner";
+import { registerStudioDevCacheTools } from "./dev-cache-tools";
+import { SlipTwoUpOverlay } from "./slip-two-up-overlay";
+
+// Console entry in all builds (pireelStudioDev.clearReviewCache / clearTtsCache): module scope on
+// purpose — available as soon as any workbench chunk loads, no component lifecycle involved.
+registerStudioDevCacheTools();
 import { useCaptionsOps } from "./use-captions-ops";
 import { useClipInsert } from "./use-clip-insert";
 import { useElementOps } from "./use-element-ops";
@@ -393,6 +425,7 @@ import {
   nativeProjectSharedLocalAssets,
 } from "./native-project-session";
 import { ProjectOutputSwitcher } from "./project-output-switcher";
+import { previewStageGeometry } from "./preview-stage-geometry";
 import { useProjectOutputs } from "./use-project-outputs";
 import { useProjectOutputRuntime } from "./use-project-output-runtime";
 import {
@@ -404,13 +437,14 @@ import {
   fitEditableBoxIntoSafeArea,
   withEditableBlockGeometry,
 } from "./editable-block-geometry";
+import { webFontStylesheetUrls } from '@pireel/studio-engine/font-library';
+import { ensureWebFontStylesheets } from './web-fonts';
 
 // The workbench calls semantic template helpers during its first render. Keep the
 // registration call in this concrete client entry as well as the engine barrel:
 // production tree-shaking can flatten a re-export barrel before evaluating it.
 ensureTemplatesRegistered();
 
-const PREVIEW_FALLBACK_W = 320; // fallback width before parent size is measured
 const RAIL_NAV_W = 48; // vertical primary-nav strip on the rail's outer edge; railW measures the CONTENT column only
 const UNDO_CAP = 20; // undo snapshot stack cap (each = canonical V2 document, incl. custom block payloads)
 
@@ -447,6 +481,12 @@ type FloatKind =
   | "anim"
   | "transition"
   | "captions";
+
+/** Consecutive caption-derivation passes allowed to start from the effect's own publish before it stops relaying. */
+const CAPTION_DERIVE_MAX_CHAIN = 8;
+
+/** Bridge tools that report/choose the active output; they re-anchor the agent instead of being gated by it. */
+const OUTPUT_ANCHOR_TOOLS = new Set(["get_state", "list_outputs", "switch_output", "create_output", "duplicate_output", "delete_output"]);
 
 export function HyperframesWorkbench({
   projectId,
@@ -531,6 +571,53 @@ export function HyperframesWorkbench({
       ),
     [renderPlan],
   );
+  /** Device-local video assets carry no metadata.durationSec (registration never probes bytes).
+   *  Probe it lazily from the resolved playable URL — metadata preload only, one per asset. */
+  const probedSourceDurationsRef = useRef(new Map<string, number>());
+  const [probedSourceDurationsRev, setProbedSourceDurationsRev] = useState(0);
+  useEffect(() => {
+    const primaryId = editorDocument.semantics.primaryNarrativeTrackId;
+    const track = renderPlan.tracks.find((candidate) => candidate.id === primaryId);
+    for (const entry of track?.clips ?? []) {
+      if (entry.clip.kind !== "narrative" || !entry.resolvedSource) continue;
+      const assetId = entry.clip.assetId;
+      if (editorDocument.assets[assetId]?.metadata.durationSec != null) continue;
+      if (probedSourceDurationsRef.current.has(assetId)) continue;
+      probedSourceDurationsRef.current.set(assetId, 0); // in-flight marker: never probe twice
+      const probe = document.createElement("video");
+      probe.preload = "metadata";
+      probe.onloadedmetadata = () => {
+        if (Number.isFinite(probe.duration) && probe.duration > 0) {
+          probedSourceDurationsRef.current.set(assetId, probe.duration);
+          setProbedSourceDurationsRev((value) => value + 1);
+        } else {
+          probedSourceDurationsRef.current.delete(assetId);
+        }
+        probe.removeAttribute("src");
+        probe.load();
+      };
+      probe.onerror = () => probedSourceDurationsRef.current.delete(assetId);
+      probe.src = entry.resolvedSource;
+    }
+  }, [renderPlan, editorDocument]);
+
+  /** Source total duration per primary SHOT id (shot ids ARE narrative clip ids) — the slip
+   *  gesture/panel needs the full source extent, which the legacy VideoShot projection lacks. */
+  const shotSourceDurations = useMemo(() => {
+    const out = new Map<string, number>();
+    const primary = editorDocument.timeline.tracks.find(
+      (track) => track.id === editorDocument.semantics.primaryNarrativeTrackId,
+    );
+    for (const clip of primary?.clips ?? []) {
+      if (clip.kind !== "narrative") continue;
+      const durationSec = editorDocument.assets[clip.assetId]?.metadata.durationSec
+        ?? probedSourceDurationsRef.current.get(clip.assetId);
+      if (durationSec != null && durationSec > 0) out.set(clip.id, durationSec);
+    }
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorDocument, probedSourceDurationsRev]);
+
   const timelineTrackStates = useMemo<TimelineTrackState[]>(
     () =>
       renderPlan.tracks.map((track) => ({
@@ -754,6 +841,17 @@ export function HyperframesWorkbench({
   // be clobbered by the incoming generation — inside this window the patch path steps aside and falls back to a full
   // doc rebuild (rebuild composes the latest comp, always correct)
   const pendingSwitchRef = useRef(false);
+  // A live back-buffer is not ready to debut until its video canvas has received the current frame.
+  // Ping/pong proves only that the runtime listener exists; switching on pong alone exposed the
+  // untouched white canvas during rapid Agent rebuilds. The resident decoder primes this exact
+  // buffer first, then the delivery callback performs the atomic swap.
+  const previewFramePrimeRef = useRef<{
+    idx: 0 | 1;
+    doc: string;
+    attempts: number;
+    timer: ReturnType<typeof setTimeout> | null;
+    onDelivered: () => void;
+  } | null>(null);
   // Full doc rebuild in progress (write back-buffer → handshake → swap): show an "updating frame" indicator in the
   // stage corner, covering all structural changes uniformly — manual insert / AI block landing / theme mount, etc.
   // (users reported no feedback in the gap between insert and display)
@@ -845,10 +943,15 @@ export function HyperframesWorkbench({
   // Debug instruments (analysis/face/source) are admin-only: no entry rendered for normal users
   const [isAdmin, setIsAdmin] = useState(false);
   useEffect(() => {
-    fetch("/api/me")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((b: { role?: string } | null) => setIsAdmin(b?.role === "admin"))
+    let alive = true;
+    loadCurrentUser()
+      .then((value) => {
+        if (alive) setIsAdmin(value?.role === "admin");
+      })
       .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, []);
   // Right-panel categories (selected via the vertical toolbar): chat / image / video / blocks / upload / captions / frame (code = source drill-down of the selected block)
   const [codeBlockId, setCodeBlockId] = useState<string | null>(null); // which block the source editor is viewing
@@ -890,6 +993,19 @@ export function HyperframesWorkbench({
   const cloudSaveQueueRef =
     useRef<CloudProjectSaveQueue<ProjectSavePayload> | null>(null);
   const cloudSaveQueueProjectRef = useRef(projectId);
+  const cloudAutosaveActivationRef = useRef<{
+    projectId: string;
+    activation: DeferredActivation;
+  } | null>(null);
+  if (
+    !cloudAutosaveActivationRef.current ||
+    cloudAutosaveActivationRef.current.projectId !== projectId
+  ) {
+    cloudAutosaveActivationRef.current = {
+      projectId,
+      activation: new DeferredActivation(),
+    };
+  }
   const cloudSaveQueueDisposerRef = useRef<DeferredEffectDisposer | null>(null);
   if (!cloudSaveQueueDisposerRef.current)
     cloudSaveQueueDisposerRef.current = new DeferredEffectDisposer();
@@ -907,6 +1023,7 @@ export function HyperframesWorkbench({
   /** Insert-source transcripts (key = shot.src, sentence times = that source file's own timeline). All sources transcribed when opening the captions / smart-cut panels. */
   const [clipAsr, setClipAsr] = useState<Record<string, AsrSegment[]>>({});
   const [filmstrip, setFilmstrip] = useState<FilmstripFrame[]>([]);
+  const [timelineFilmstripDemand, setTimelineFilmstripDemand] = useState<Record<string, FilmstripSourceRange[]>>({});
   useEffect(() => {
     let cancelled = false;
     migrateLegacyDraft();
@@ -961,9 +1078,16 @@ export function HyperframesWorkbench({
     setLocateSignal((n) => n + 1);
   };
   const [libTab, setLibTab] = useState<
-    "assets" | "frames" | "script" | "captions" | "audio" | "gen" | "avatar"
+    "assets" | "frames" | "script" | "captions" | "audio" | "text" | "gen" | "avatar"
   >("assets"); // rail primary-nav tab (themes hidden)
   const [libCollapsed, setLibCollapsed] = useState(false); // asset rail collapsed (narrow strip + expand button; content hidden but state kept)
+  const selectedDisplayTextBlock = useMemo(
+    () => selectedId
+      ? comp.blocks.find((block) => block.id === selectedId && block.templateId === "title") ?? null
+      : null,
+    [comp.blocks, selectedId],
+  );
+  const selectedDisplayTextBlockId = selectedDisplayTextBlock?.id ?? null;
   // Asset rail geometry: the expanded content width is drag-resizable and persists. Collapsing
   // keeps the primary-nav strip docked so navigation and the expand control stay in one place.
   const [railW, setRailW] = useState(() => {
@@ -1205,8 +1329,13 @@ export function HyperframesWorkbench({
     docs: [string, string];
     dims: [{ w: number; h: number }, { w: number; h: number }];
     active: 0 | 1;
+    /** Per-buffer doc revision: the iframe is keyed on it so a doc change REMOUNTS the frame.
+     *  Navigating a mounted iframe (srcDoc mutation) pushes a session-history entry each time —
+     *  minutes of editing made the browser Back button need dozens of presses to leave. */
+    revs: [number, number];
   }>(() => ({
     docs: [injectPreviewRuntime(assembleHtml(starter)), ""],
+    revs: [0, 0],
     dims: [
       { w: starter.width, h: starter.height },
       { w: starter.width, h: starter.height },
@@ -1218,14 +1347,17 @@ export function HyperframesWorkbench({
   const iframesRef = useRef<(HTMLIFrameElement | null)[]>([null, null]);
   // Stage geometry = the ACTIVE buffer's canvas (see the note at the old fit site above)
   const activeDims = bufs.dims[bufs.active];
-  const fit =
-    area.w > 0 && area.h > 0
-      ? Math.min(area.w / activeDims.w, area.h / activeDims.h)
-      : PREVIEW_FALLBACK_W / activeDims.w;
+  const stageGeometry = previewStageGeometry({
+    areaW: area.w,
+    areaH: area.h,
+    canvasW: activeDims.w,
+    canvasH: activeDims.h,
+  });
+  const fit = stageGeometry.fit;
   const fitRef = useRef(fit); // used in the (mounted-once) message handler to convert comp px → stage px
   fitRef.current = fit;
-  const boxW = Math.round(activeDims.w * fit);
-  const boxH = Math.round(activeDims.h * fit);
+  const boxW = stageGeometry.width;
+  const boxH = stageGeometry.height;
   activeStageSizeRef.current = { width: boxW, height: boxH };
   const previewAreaRef = useRef<HTMLDivElement | null>(null);
   const tRef = useRef(0);
@@ -1289,9 +1421,21 @@ export function HyperframesWorkbench({
     const eng = new VideoTrackEngine();
     videoEngineRef.current = eng;
     eng.onFrame = (frame, info, frame2) => {
-      // Push only to the active buffer (ImageBitmap transferred once); when the background buffer debuts, the bufs.active effect refreshes to backfill the frame
+      const pendingPrime = previewFramePrimeRef.current;
+      const prime = pendingPrime
+        && bufsRef.current.docs[pendingPrime.idx] === pendingPrime.doc
+        && bufsRef.current.active !== pendingPrime.idx
+        ? pendingPrime
+        : null;
+      if (pendingPrime && !prime) {
+        if (pendingPrime.timer) clearTimeout(pendingPrime.timer);
+        previewFramePrimeRef.current = null;
+      }
+      const targetIdx = prime?.idx ?? bufsRef.current.active;
+      // Ordinarily push to the active buffer. During a pending structural rebuild, one current frame
+      // is deliberately delivered to the proven-live back-buffer before it is allowed to debut.
       // frame2 = the "other side" shadow frame within a transition window (true dual-stream: before cut = B's lead-in, after cut = A's tail)
-      const w = iframesRef.current[bufsRef.current.active]?.contentWindow;
+      const w = iframesRef.current[targetIdx]?.contentWindow;
       if (!w) {
         // No target window (iframe torn down mid-decode): close instead of leaking the bitmaps
         frame.close();
@@ -1302,6 +1446,11 @@ export function HyperframesWorkbench({
         frame.close();
         frame2?.close();
         w.postMessage({ type: "hf:clearFrame", t: info.t }, "*");
+        if (prime && previewFramePrimeRef.current === prime) {
+          if (prime.timer) clearTimeout(prime.timer);
+          previewFramePrimeRef.current = null;
+          queueMicrotask(prime.onDelivered);
+        }
         return;
       }
       try {
@@ -1326,6 +1475,11 @@ export function HyperframesWorkbench({
           "*",
           frame2 ? [frame, frame2] : [frame],
         );
+        if (prime && previewFramePrimeRef.current === prime) {
+          if (prime.timer) clearTimeout(prime.timer);
+          previewFramePrimeRef.current = null;
+          queueMicrotask(prime.onDelivered);
+        }
       } catch {
         try {
           frame.close();
@@ -1336,8 +1490,19 @@ export function HyperframesWorkbench({
       }
     };
     eng.onBlank = (t) => {
-      const w = iframesRef.current[bufsRef.current.active]?.contentWindow;
+      const pendingPrime = previewFramePrimeRef.current;
+      const prime = pendingPrime
+        && bufsRef.current.docs[pendingPrime.idx] === pendingPrime.doc
+        && bufsRef.current.active !== pendingPrime.idx
+        ? pendingPrime
+        : null;
+      const w = iframesRef.current[prime?.idx ?? bufsRef.current.active]?.contentWindow;
       w?.postMessage({ type: "hf:clearFrame", t }, "*");
+      if (w && prime && previewFramePrimeRef.current === prime) {
+        if (prime.timer) clearTimeout(prime.timer);
+        previewFramePrimeRef.current = null;
+        queueMicrotask(prime.onDelivered);
+      }
     };
     eng.onTick = (t) => {
       if (!playingRef.current) return;
@@ -1361,6 +1526,9 @@ export function HyperframesWorkbench({
       setPlaying(false);
     };
     return () => {
+      const pendingPrime = previewFramePrimeRef.current;
+      if (pendingPrime?.timer) clearTimeout(pendingPrime.timer);
+      previewFramePrimeRef.current = null;
       eng.dispose();
       videoEngineRef.current = null;
     };
@@ -1376,6 +1544,10 @@ export function HyperframesWorkbench({
     total: 0,
   });
   const chatRef = useRef<StudioChatHandle | null>(null); // lets workbench actions coordinate with the active chat thread
+  // Agent activity gates output switching (chat turn streaming, or a bridge tool executing).
+  const [chatBusy, setChatBusy] = useState(false);
+  const [bridgeToolsInFlight, setBridgeToolsInFlight] = useState(0);
+  const bridgeOutputAnchorRef = useRef<{ id: string; title: string } | null>(null);
   // Export (state + submit/poll/cancel) — see use-export.ts
   /** Files for locally-inserted clips (key = blob URL; the two split halves share one src so they share naturally):
    *  same "keep local, don't upload" mode as the main video, injected into preview via hf:clipFile and read directly
@@ -2024,7 +2196,8 @@ export function HyperframesWorkbench({
     [postPreview],
   );
 
-  // Measure the preview area's available size → uniform scale to fill (tracks window/panel changes)
+  // Measure the preview area and recompute the shared canvas/overlay fit, including
+  // the vertical selection-chrome gutter (tracks window and panel changes).
   useEffect(() => {
     const el = previewAreaRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
@@ -2044,6 +2217,16 @@ export function HyperframesWorkbench({
   // box width (wPct)/preset can't skip — segmentation is derived live from box width ÷ font size, so a rebuild must
   // re-segment (the instant path gives the feel first, then a seamless swap-in after the 300ms debounce).
   const lastBuiltCompRef = useRef<Composition | null>(null);
+  // In-place swap paths bypass the full rebuild, so the active preview document never gets the
+  // <link>s assemble.ts bakes for library ("花字") fonts — push them explicitly before swapping nodes.
+  const postWebFonts = (pcomp: Composition) => {
+    const hrefs = webFontStylesheetUrls([
+      pcomp.captionStyle?.font,
+      pcomp.captionStyle?.sub?.font,
+      ...pcomp.blocks.map((block) => block.slots?.fontFamily),
+    ]);
+    if (hrefs.length) postPreview({ type: "hf:fonts", hrefs });
+  };
   const lastBuiltRenderInputsRef = useRef<{
     videoPlacements: typeof renderVideoPlacements;
     supplementalVisuals: typeof supplementalVisuals;
@@ -2063,6 +2246,9 @@ export function HyperframesWorkbench({
       l.setAttribute("data-studio-fonts", "1");
       document.head.appendChild(l);
     }
+    // Library ("花字") stylesheets in the parent too: caption segmentation measures here, and the
+    // font picker sets each name in its own face. Chunked CSS — only rendered glyph blocks load.
+    ensureWebFontStylesheets();
     let alive = true;
     void Promise.all([
       document.fonts.load("700 40px 'Noto Sans SC'"),
@@ -2235,6 +2421,7 @@ export function HyperframesWorkbench({
           // sentence-caption nodes with the new resolved style and swap them in place — segmentation
           // re-runs inside the render, so even size/width changes stay off the rebuild path
           const pcomp = previewCompOf(renderComposition);
+          postWebFonts(pcomp);
           for (const cb of pcomp.blocks) {
             if (!isSentenceCaption(cb)) continue;
             const r = assembleBlockHtml(cb, pcomp);
@@ -2280,6 +2467,7 @@ export function HyperframesWorkbench({
             );
             const domIndexOf = (id: string) =>
               sorted.findIndex((x) => x.id === id);
+            postWebFonts(pcomp);
             const sendNode = (id: string, withIndex: boolean) => {
               const pb = pblockOf(id);
               if (!pb) return;
@@ -2441,7 +2629,9 @@ export function HyperframesWorkbench({
             { w: number; h: number },
           ];
           dims[back] = { w: comp.width, h: comp.height };
-          return { docs, dims, active: s.active };
+          const revs = [...s.revs] as [number, number];
+          revs[back] += 1;
+          return { docs, dims, active: s.active, revs };
         });
       },
       fontsChanged ||
@@ -2477,6 +2667,9 @@ export function HyperframesWorkbench({
     tries: number;
   } | null>(null);
   const startSwitchPing = useCallback((idx: 0 | 1, doc: string) => {
+    const stalePrime = previewFramePrimeRef.current;
+    if (stalePrime?.timer) clearTimeout(stalePrime.timer);
+    previewFramePrimeRef.current = null;
     const prev = switchPingRef.current;
     if (prev?.timer) clearTimeout(prev.timer);
     const st = {
@@ -2656,6 +2849,24 @@ export function HyperframesWorkbench({
   // deliverable. A secondary visual lane can be the whole edit, so primary-track presence must not
   // decide whether an output owns a cover.
   const coverThumbRef = useRef<string | null>(null);
+  // Cover BYTES travel their own debounced channel (providers.projects.saveCover → R2 key in the
+  // row); the JSON save payload never carries base64 — it multiplied every project PUT/GET/list.
+  const coverCloudTimerRef = useRef<number | null>(null);
+  const coverCloudPushedSigRef = useRef<string | null>(null);
+  const scheduleCoverCloudPush = (cover: Blob | null, sig: string | null) => {
+    const saveCover = studioProviders().projects.saveCover;
+    if (!saveCover || sig === coverCloudPushedSigRef.current) return;
+    if (coverCloudTimerRef.current) window.clearTimeout(coverCloudTimerRef.current);
+    coverCloudTimerRef.current = window.setTimeout(() => {
+      coverCloudTimerRef.current = null;
+      if (displacedRef.current) return;
+      void saveCover(projectId, cover)
+        .then(() => {
+          coverCloudPushedSigRef.current = sig;
+        })
+        .catch(() => {}); // a cover is a bonus; the next redraw retries
+    }, 2_500);
+  };
   // Cover clearing must wait for hydration: the first render is intentionally empty even when a
   // saved project has video. Once ready, an empty primary track is authoritative user state.
   const [bootDataReady, setBootDataReady] = useState(false);
@@ -2716,6 +2927,7 @@ export function HyperframesWorkbench({
       if (!bootDataReady) return;
       coverThumbRef.current = null;
       saveCoverThumb(projectId, null);
+      scheduleCoverCloudPush(null, null);
       return;
     }
     if (!coverVisual) return;
@@ -2738,6 +2950,10 @@ export function HyperframesWorkbench({
       cv.getContext("2d")!.drawImage(media, (w - drawW) / 2, (h - drawH) / 2, drawW, drawH);
       coverThumbRef.current = cv.toDataURL("image/jpeg", 0.8);
       saveCoverThumb(projectId, coverThumbRef.current);
+      const sig = coverThumbRef.current;
+      cv.toBlob((blob) => {
+        if (blob) scheduleCoverCloudPush(blob, sig);
+      }, "image/jpeg", 0.8);
     };
     void (async () => {
       try {
@@ -2892,6 +3108,15 @@ export function HyperframesWorkbench({
     floatWinRef.current = next;
     setFloatWinRaw(next);
   };
+  useEffect(() => {
+    if (!selectedDisplayTextBlockId) return;
+    setFloatWin(null);
+    setLibTab("text");
+    setLibCollapsed(false);
+    // Re-open only when the selected text block changes; setFloatWin intentionally owns
+    // contextual-panel settlement but is not stable across renders.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDisplayTextBlockId]);
   // The source-editor entry is removed (per user 2026-07-17; edit components via "AI edit"/chat). The panel machinery
   // (FloatKind 'code'/ElementSourceEditor/draft settlement) is kept; to restore the entry later: set the baseline
   // codeOrigRef + setCodeBlockId(id) + setFloatWin('code'), and pin the playhead to a stable frame.
@@ -3251,11 +3476,12 @@ export function HyperframesWorkbench({
       if (d.type === "pong") {
         const st = switchPingRef.current;
         if (st && d.nonce === st.nonce && fromBack) {
-          // Target doc confirmed live → wait one beat (video/fonts settle) then swap atomically; the old buffer pauses and clears
+          // Target doc confirmed live. Do not swap yet: its video canvas is still untouched. Prime
+          // the current picture into this exact buffer, then debut it on successful frame delivery.
           switchPingRef.current = null;
           if (st.timer) clearTimeout(st.timer);
           const { idx, doc } = st;
-          setTimeout(() => {
+          const commitSwitch = () => {
             if (
               bufsRef.current.docs[idx] !== doc ||
               bufsRef.current.active === idx
@@ -3279,8 +3505,11 @@ export function HyperframesWorkbench({
             setBufs((s) => {
               if (s.docs[idx] !== doc) return s;
               const docs = [...s.docs] as [string, string];
-              docs[s.active === idx ? (idx === 0 ? 1 : 0) : s.active] = "";
-              return { ...s, docs, active: idx };
+              const cleared = s.active === idx ? (idx === 0 ? 1 : 0) : s.active;
+              docs[cleared] = "";
+              const revs = [...s.revs] as [number, number];
+              revs[cleared] += 1;
+              return { ...s, docs, active: idx, revs };
             });
             // Replay the alignment now that the pong PROVED this doc listens: the load-time hf:seek can hit a
             // deaf half-loaded doc (the known pit) and vanish — a paused boot then leaves caption timelines at
@@ -3295,7 +3524,42 @@ export function HyperframesWorkbench({
             } catch {
               /* ignore */
             }
-          }, 120);
+          };
+          const prime = {
+            idx,
+            doc,
+            attempts: 0,
+            timer: null as ReturnType<typeof setTimeout> | null,
+            onDelivered: commitSwitch,
+          };
+          previewFramePrimeRef.current = prime;
+          const requestPrime = () => {
+            if (previewFramePrimeRef.current !== prime) return;
+            if (
+              bufsRef.current.docs[idx] !== doc ||
+              bufsRef.current.active === idx
+            ) {
+              previewFramePrimeRef.current = null;
+              return;
+            }
+            prime.attempts += 1;
+            videoEngineRef.current?.refresh();
+            if (prime.attempts < 10) {
+              prime.timer = setTimeout(requestPrime, 300);
+              return;
+            }
+            // Preserve the old complete frame instead of revealing an unprimed canvas. A later
+            // document change starts a fresh generation; this one has already failed ten seeks.
+            previewFramePrimeRef.current = null;
+            pendingSwitchRef.current = false;
+            setRebuilding(false);
+            setPendingInsert(null);
+            console.warn(
+              "[studio] background buffer never received a video frame; keeping the previous complete preview",
+              { idx },
+            );
+          };
+          requestPrime();
         } else if (d.nonce === "boot" && fromBack) {
           // Runtime boot beacon (scripts parsed, gsap loaded, listener installed): start the swap handshake
           // NOW instead of waiting for the iframe load event. The load event waits for every eager media
@@ -4009,7 +4273,7 @@ export function HyperframesWorkbench({
         const direct = await loadLocalVideo(asset.locator.localSig);
         if (direct) return direct;
         const entry = localAssetIndexRef.current.find(
-          (item) => item.sig === asset.locator.localSig,
+          (item) => item.contentSig === asset.locator.localSig,
         );
         if (entry?.folder) {
           const folder = await loadLocalFolderFile(
@@ -4099,6 +4363,7 @@ export function HyperframesWorkbench({
       // Capabilities go through the provider (open-source split phase 2): the hosted shell = server LLM + billing; the OSS shell can swap the implementation or use BYO
       return studioProviders().composer.composeStream(
         {
+          projectId,
           block: {
             id: seed.id,
             kind: seed.kind,
@@ -4212,10 +4477,11 @@ export function HyperframesWorkbench({
         });
         const hard = issues.filter((i) => HARD_LINT_CODES.has(i.code));
         if (hard.length)
-          throw new Error(
+          throw new GeneratedBlockValidationError(
             t("workbench.generatedBlockFailedChecks", {
               message: hard[0]!.message,
             }),
+            hard.map((issue) => issue.message),
           );
         if (issues.length)
           console.warn("[studio] block lint soft issues", seed.id, issues);
@@ -4407,6 +4673,19 @@ export function HyperframesWorkbench({
     });
   };
   /** Per-shot audio commit (volume/mute): the engine-segment effect refeeds gains from comp.shots. */
+  /** Constant speed for one video clip (any visual lane): the engine's set_video_speed retime — the
+   *  same op the agent uses — so UI and agent produce identical documents; one undo step. */
+  const setShotSpeed = (sid: string, speed: number) => {
+    const current = editorDocumentRef.current;
+    const outcome = runAgentTimelineTool(current, "set_video_speed", { shotIds: [sid], speed });
+    if (!outcome.ok || !outcome.document) {
+      if (outcome.error) toast.error(outcome.error);
+      return;
+    }
+    if (outcome.document === current) return;
+    pushUndoSnapshot();
+    setEditorDocument(outcome.document);
+  };
   const setShotAudio = (
     sid: string,
     patch: {
@@ -5130,6 +5409,64 @@ export function HyperframesWorkbench({
       t("workbench.insertedLabel", { label: t(b.label ?? templateId) }),
     );
   };
+
+  /** Persistent UI text entry: insert a deterministic native text clip at the playhead, select it,
+   * and hand off to the same Text panel used by Agent-created titles. */
+  const insertDisplayText = (preset: DisplayTextPresetId = "clean") => {
+    const startSec = Math.max(0, Math.round(tRef.current * 10) / 10);
+    const durationSec = 3;
+    const presetDefinition = displayTextPreset(preset);
+    const block = titleBlock({
+      text: t("displayText.defaultText"),
+      startSec,
+      durationSec,
+      preset,
+      animation: presetDefinition.defaultAnimation,
+      color: "#FFFFFF",
+      accentColor: "#FFD24D",
+      trackIndex: freeTrack(compRef.current.blocks, startSec, durationSec, 2),
+    });
+    block.box = { x: 0.1, y: 0.36, w: 0.8, h: 0.22 };
+    const inserted = insertOverlayDocumentClip({
+      document: editorDocumentRef.current,
+      block,
+    });
+    if (!inserted.ok) {
+      toast.error(editorErrorMessage(inserted.error));
+      return;
+    }
+    pushUndoSnapshot();
+    setEditorDocument(inserted.document);
+    setSelectedShotId(null);
+    setSelectedId(block.id);
+    setFloatWin(null);
+    setLibTab("text");
+    setLibCollapsed(false);
+    if (!playing) applyT(Math.max(0, startSec + 0.01));
+  };
+
+  const patchDisplayText = (patch: DisplayTextPatch) => {
+    if (!selectedDisplayTextBlock) return;
+    const slots = { ...selectedDisplayTextBlock.slots, ...patch };
+    const edit = applyOverlayDocumentEdits({
+      document: editorDocumentRef.current,
+      updates: [{
+        clipId: selectedDisplayTextBlock.id,
+        block: {
+          slots,
+          ...(typeof patch.text === "string"
+            ? { label: patch.text.trim() || t("displayText.defaultText") }
+            : {}),
+        },
+      }],
+    });
+    if (!edit.ok) {
+      toast.error(editorErrorMessage(edit.error));
+      return;
+    }
+    pushUndoSnapshot();
+    setEditorDocument(edit.document);
+  };
   /** Generated video → set as the main video. The CDN has no CORS headers, so fetch bytes through the /api/media/fetch same-origin proxy.
    *  Swapping the main video = a new project (pickVideoFile clears shots/blocks) — confirm first if there's content. */
   const setMainVideoFromUrl = async (url: string) => {
@@ -5415,6 +5752,7 @@ export function HyperframesWorkbench({
     videoFileRef,
     videoSigRef,
     videoEngineRef,
+    clipFilesRef,
     pushUndoSnapshot,
   });
   denoiseExportRef.current = denoiseOps.denoiseForExport;
@@ -5757,7 +6095,7 @@ export function HyperframesWorkbench({
    *  vault, then a manual re-pick verified against the sig. src = null targets the main source. */
   const reconnectSource = async (src: string | null, sig?: string | null) => {
     const indexedKind = sig
-      ? localAssetIndexRef.current.find((entry) => entry.sig === sig)?.kind
+      ? localAssetIndexRef.current.find((entry) => entry.contentSig === sig)?.kind
       : undefined;
     let f = sig ? await loadLocalVideo(sig) : null;
     if (!f && sig) {
@@ -6145,7 +6483,7 @@ export function HyperframesWorkbench({
             clipAsrFailRef.current.add(src);
             return;
           }
-          const segs = await studioProviders().transcriber.transcribe(got.file);
+          const segs = await studioProviders().transcriber.transcribe(got.file, { projectId });
           setClipAsr((m) => ({ ...m, [src]: segs }));
           clipAsrRef.current = { ...clipAsrRef.current, [src]: segs }; // mirror immediately: the re-lay below needs to read it
           // The native caption derivation effect observes clipAsr and relays this source atomically.
@@ -6400,7 +6738,6 @@ export function HyperframesWorkbench({
     resetRuntime: resetClipRuntime,
   } = useClipInsert({
     projectId,
-    comp,
     compRef,
     clipFilesRef,
     cloudMediaRef,
@@ -6416,7 +6753,7 @@ export function HyperframesWorkbench({
     ensureClipTranscripts,
     backupMediaToCloud,
     runTool: (toolId, input) => runToolRef.current(toolId, input),
-    visualSources: supplementalVisuals,
+    filmstripDemand: timelineFilmstripDemand,
   });
   const resetForOutputChange = useCallback(() => {
     setPlaying(false);
@@ -6763,11 +7100,36 @@ export function HyperframesWorkbench({
   const runStudioTool = (
     toolId: string,
     input: Record<string, unknown>,
-    opts?: { signal?: AbortSignal; surface?: "chat" | "bridge" },
-  ) => persistToolMutation(runAgentStudioTool(agentToolCtx, toolId, input, opts));
+    opts?: { signal?: AbortSignal; surface?: "chat" | "bridge"; skillId?: string },
+  ) => (toolId === "run_v3"
+    // v3 surface from the chat: same executor as the external bridge, with the chat surface carried in the input
+    // so parked interactions (ask_user / approvals) render as chat cards.
+    ? persistToolMutation(runAgentExternalTool(agentToolCtx, "run_v3", { ...input, surface: opts?.surface ?? "chat" }))
+    : persistToolMutation(runAgentStudioTool(agentToolCtx, toolId, input, opts)));
   runToolRef.current = runStudioTool; // break the hook↔dispatcher cycle (assigned every render before any handler can fire)
-  const runExternalTool = (tool: string, input: Record<string, unknown>) =>
-    persistToolMutation(runAgentExternalTool(agentToolCtx, tool, input));
+  // Bridge (MCP) calls span many turns with the tab live in between, so the user can switch
+  // outputs mid-task. The agent's edits stay anchored to the output it last observed: tools that
+  // report the active output re-anchor; anything else is refused when the tab has moved on, and
+  // the error names both outputs so the agent can switch back or adopt the current one.
+  const runExternalTool = async (tool: string, input: Record<string, unknown>) => {
+    const activeBefore = projectOutputs.outputsRef.current.active;
+    const anchored = bridgeOutputAnchorRef.current;
+    if (!OUTPUT_ANCHOR_TOOLS.has(tool) && anchored && anchored.id !== activeBefore.id) {
+      return {
+        ok: false,
+        error: t("workbench.outputChangedUnderAgent", { active: activeBefore.title || t("workbench.untitledOutput"), anchored: anchored.title || t("workbench.untitledOutput") }),
+        data: { activeOutputId: activeBefore.id, anchoredOutputId: anchored.id },
+      } satisfies StudioToolResult;
+    }
+    setBridgeToolsInFlight((n) => n + 1);
+    try {
+      return await persistToolMutation(runAgentExternalTool(agentToolCtx, tool, input));
+    } finally {
+      setBridgeToolsInFlight((n) => Math.max(0, n - 1));
+      const activeAfter = projectOutputs.outputsRef.current.active;
+      bridgeOutputAnchorRef.current = { id: activeAfter.id, title: activeAfter.title };
+    }
+  };
 
   // External agent bridge (Codex/Claude Code/any MCP client via /api/studio/mcp → StudioBridge DO → this tab):
   // the exact same execution surface as the internal chat + BYO-only operations; get_state returns the same situation snapshot as chat.
@@ -6779,6 +7141,7 @@ export function HyperframesWorkbench({
     getState: () => {
       const outputs = listProjectOutputsForAgent();
       const activeOutput = outputs.find((output) => output.active)!;
+      bridgeOutputAnchorRef.current = { id: activeOutput.id, title: activeOutput.title };
       return `<composition_state>\nLIVE — the studio tab is open on project ${projectId}; bridge tools edit THIS project (switch_project only retargets OFFLINE mode).\nActive output: #${activeOutput.position} · ${activeOutput.id} · ${activeOutput.title} (${outputs.length} total; use list_outputs/switch_output for deliverables).\n${buildSituation(getChatBody() as ChatSituation)}\n</composition_state>`;
     },
     onDisplaced: () => {
@@ -6855,7 +7218,6 @@ export function HyperframesWorkbench({
             videoDurationSec: firstNarrativeDurationSec(
               editorDocumentRef.current,
             ),
-            coverThumb: currentCoverThumb(),
           }
         : null;
     }
@@ -6875,7 +7237,6 @@ export function HyperframesWorkbench({
         videoSigRef.current ??
         (videoFileRef.current ? fileSig(videoFileRef.current) : null),
       videoDurationSec: firstNarrativeDurationSec(editorDocumentRef.current),
-      coverThumb: currentCoverThumb(),
     };
   }
 
@@ -7129,6 +7490,66 @@ export function HyperframesWorkbench({
     selectVisualClip(clipId);
   };
 
+  const commitNarrativeClipResize = (
+    clipId: string,
+    edge: "left" | "right",
+    atSec: number,
+  ) => {
+    const edit = resizeNarrativeTimelineClip(
+      editorDocumentRef.current,
+      clipId,
+      edge,
+      atSec,
+    );
+    if (!edit.ok || !edit.document) {
+      toast.error(edit.error || t("editorError.operationFailed"));
+      return;
+    }
+    pushUndoSnapshot();
+    setEditorDocument(edit.document);
+    setSelectedShotId(clipId);
+  };
+
+  /** Slip two-up (over the preview stage): the slid window's new first/last frame while a slip
+   *  gesture is active. Source resolves through the render plan's playable URL per shot. */
+  const [slipTwoUp, setSlipTwoUp] = useState<{
+    source: string;
+    startSec: number;
+    endSec: number;
+  } | null>(null);
+  const onSlipPreview = (
+    state: { shotId: string; startSec: number; endSec: number } | null,
+  ) => {
+    if (!state) {
+      setSlipTwoUp(null);
+      return;
+    }
+    const primaryId = editorDocumentRef.current.semantics.primaryNarrativeTrackId;
+    const entry = renderPlan.tracks
+      .find((track) => track.id === primaryId)
+      ?.clips.find((candidate) => candidate.clipId === state.shotId);
+    setSlipTwoUp(entry?.resolvedSource
+      ? { source: entry.resolvedSource, startSec: state.startSec, endSec: state.endSec }
+      : null);
+  };
+
+  /** Slip commit (alt-drag on a shot body): the source window shifts, timeline geometry is
+   *  untouched, so no retime/ripple — the engine clamps the delta against the asset again. */
+  const commitNarrativeClipSlip = (clipId: string, sourceDeltaSec: number) => {
+    const edit = slipNarrativeTimelineClip(
+      editorDocumentRef.current,
+      clipId,
+      sourceDeltaSec,
+    );
+    if (!edit.ok || !edit.document) {
+      toast.error(edit.error || t("editorError.operationFailed"));
+      return;
+    }
+    pushUndoSnapshot();
+    setEditorDocument(edit.document);
+    setSelectedShotId(clipId);
+  };
+
   const timelineCbs = useStableCallbacks({
     onPps: setPps,
     onSeek: (v: number) => {
@@ -7180,6 +7601,9 @@ export function HyperframesWorkbench({
     onSelectShot: selectShot,
     onBoxSelectShots: selectShotsBox,
     onMoveShot: commitVisualClipMove,
+    onResizeShot: commitNarrativeClipResize,
+    onSlipShot: commitNarrativeClipSlip,
+    onSlipPreview,
     onSelectVisualClip: selectVisualClip,
     onDeselectAll: () => {
       setSelectedVisualClipId(null);
@@ -7391,7 +7815,7 @@ export function HyperframesWorkbench({
       // the user's requested timeline order.
       const visualIds = targetIds.filter((id) => {
         const track = tracks.find((candidate) => candidate.id === id);
-        return track?.type !== "audio" && track?.role !== "primaryNarrative";
+        return track?.type !== "audio" && track?.role !== "primaryNarrative" && track?.role !== "managedCaptions";
       });
       const visualEdit = reorderOverlayDocumentTracks(current, visualIds);
       if (!visualEdit.ok) {
@@ -7525,15 +7949,37 @@ export function HyperframesWorkbench({
   // comp.blocks for every consumer (preview/timeline/selection/agent) but NEVER persisted — autosave
   // strips them; the transcript is the single stored source. This one reactive effect replaces the old
   // scattered manual re-lays: any transcript/cut/toggle change re-derives, so blocks can't go stale.
+  // Self-trigger breaker: this effect's own publish re-projects comp.blocks, which re-arms the
+  // effect. The engine promises reference identity when nothing changed, but a pipeline that
+  // fails to reach a fixed point (two writers of one transcript, a relay/lock pair that keep
+  // normalizing each other) would otherwise publish on every pass until React throws
+  // "Maximum update depth exceeded" and the whole editor unmounts. Count consecutive passes that
+  // start from our own last publish; past the cap, stop relaying and surface the diff instead.
+  const captionDeriveRunRef = useRef<{ published: EditorDocumentV2 | null; runs: number }>({ published: null, runs: 0 });
   useEffect(() => {
     if (!bootDataReady) return;
+    const before = editorDocumentRef.current;
+    const chain = captionDeriveRunRef.current;
+    chain.runs = chain.published === before ? chain.runs + 1 : 0;
+    if (chain.runs >= CAPTION_DERIVE_MAX_CHAIN) {
+      if (chain.runs === CAPTION_DERIVE_MAX_CHAIN) {
+        console.error("[studio] caption derivation did not settle; relay paused for this document", {
+          transcripts: JSON.stringify(before.semantics.transcripts).length,
+          managedCaptionTrackId: before.semantics.managedCaptionTrackId,
+          managedCaptionSource: before.semantics.managedCaptionSource,
+        });
+      }
+      return;
+    }
     const edit = applyCaptionDocumentEdit({
-      document: editorDocumentRef.current,
+      document: before,
       mainTranscript: asrRef.current,
       clipTranscripts: clipAsrRef.current,
     });
-    if (edit.ok && edit.document !== editorDocumentRef.current)
+    if (edit.ok && edit.document !== before) {
       setEditorDocument(edit.document);
+      chain.published = editorDocumentRef.current; // publish() stores the canonical document synchronously
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     bootDataReady,
@@ -7632,12 +8078,18 @@ export function HyperframesWorkbench({
       if (timer != null) window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         void cloudSaveChainRef.current.then(async () => {
+          // Dirty-but-unflushed local state sits in the save queue's debounce, NOT in the save
+          // chain — a remote snapshot fetched now predates local intent, and adopting it would
+          // wipe just-imported assets (the panel treats a confirmed cloud index as exact).
+          // Skip; the next focus/visibility event retries once the push has been acknowledged.
+          if (cloudSaveQueueRef.current?.hasPendingSave) return;
           const mutationRev = localAssetIndexMutationRevRef.current;
           const remote = await studioProviders().projects.load(projectId);
           if (
             dead ||
             ticket !== request ||
-            mutationRev !== localAssetIndexMutationRevRef.current
+            mutationRev !== localAssetIndexMutationRevRef.current ||
+            cloudSaveQueueRef.current?.hasPendingSave
           )
             return;
           if (remote)
@@ -7673,7 +8125,13 @@ export function HyperframesWorkbench({
   // its in-memory state is by definition stale, and "retry until it lands" is exactly how a zombie tab clobbers the writer.
   useEffect(() => {
     // No content gate here: buildCloudPayload decides (full payload / null).
-    if (!projectId || displaced || migrationWriteBlockedRef.current) return;
+    if (!bootDataReady || !projectId) return;
+    const activation = cloudAutosaveActivationRef.current!.activation;
+    // Hydration, derived captions, restored media and output metadata can settle over several
+    // effects. None is user intent. Wait until that cascade is quiet before autosave can become
+    // dirty; real edits after the editor is interactive still take the normal 1.2s path.
+    if (!activation.active) return activation.defer();
+    if (displaced || migrationWriteBlockedRef.current) return;
     cloudSaveQueue.markDirty();
     const timer = window.setTimeout(() => {
       if (displacedRef.current || migrationWriteBlockedRef.current) return; // demoted/migration-blocked while this timer was armed
@@ -7682,6 +8140,7 @@ export function HyperframesWorkbench({
     return () => window.clearTimeout(timer);
     // asrSentences/clipAsr are also deps: changes that touch only the transcript, not comp (like translations (sub)), must sync too
   }, [
+    bootDataReady,
     comp,
     editorDocument,
     videoFile,
@@ -7807,6 +8266,7 @@ export function HyperframesWorkbench({
               <StudioChat
                 key={chatEpoch}
                 ref={chatRef}
+                projectId={projectId}
                 runTool={chatCbs.runTool}
                 getBody={getChatBody}
                 getComp={getChatComp}
@@ -7821,6 +8281,7 @@ export function HyperframesWorkbench({
                 initialThreads={initialChatThreads}
                 onThreadChange={persistChatThread}
                 onClose={closeChat}
+                onBusyChange={setChatBusy}
               />
             ) : (
               <div className="text-ink-4 flex h-full w-full items-center justify-center">
@@ -7860,6 +8321,8 @@ export function HyperframesWorkbench({
               deleteLabel={t("workbench.deleteOutput")}
               untitledLabel={t("workbench.untitledOutput")}
               switching={outputRuntime.switching}
+              locked={chatBusy || bridgeToolsInFlight > 0}
+              lockedHint={t("workbench.outputSwitchPausedByAgent")}
               onSwitch={switchOutput}
               onCreate={createOutput}
               onDelete={requestDeleteOutput}
@@ -7975,7 +8438,7 @@ export function HyperframesWorkbench({
                     local blob videos aren't readable → onBufLoad hands the File in to build its own URL; the control protocol is all postMessage. */}
                     {([0, 1] as const).map((i) => (
                       <iframe
-                        key={i}
+                        key={`${i}:${bufs.revs[i]}`}
                         ref={(el) => {
                           iframesRef.current[i] = el;
                         }}
@@ -8045,6 +8508,15 @@ export function HyperframesWorkbench({
                     <div
                       aria-hidden
                       className="absolute inset-0 z-40 cursor-wait"
+                    />
+                  )}
+                  {/* Slip two-up: while a slip drag is live, the stage shows the slid window's
+                      new first and last frame (industry-standard slip feedback). */}
+                  {slipTwoUp && (
+                    <SlipTwoUpOverlay
+                      source={slipTwoUp.source}
+                      startSec={slipTwoUp.startSec}
+                      endSec={slipTwoUp.endSec}
                     />
                   )}
                   {/* Native video/image placement: the layer box is independent from source framing.
@@ -8216,7 +8688,7 @@ export function HyperframesWorkbench({
                                   csSel.wPct ?? 56,
                                   csSel.scale,
                                   comp.width,
-                                  { bold: csSel.bold },
+                                  { bold: csSel.bold, font: csSel.font },
                                 ).length,
                               )
                             : 1;
@@ -8242,7 +8714,7 @@ export function HyperframesWorkbench({
                               base.wPct ?? 56,
                               base.scale,
                               comp.width,
-                              { bold: base.bold },
+                              { bold: base.bold, font: base.font },
                             ).length,
                           );
                           if (n0 <= 1) return base;
@@ -8282,7 +8754,7 @@ export function HyperframesWorkbench({
                                 subStyleSel.wPct ?? 56,
                                 subStyleSel.scale,
                                 comp.width,
-                                { bold: subStyleSel.bold },
+                                { bold: subStyleSel.bold, font: subStyleSel.font },
                               ).length,
                             )
                           : 1;
@@ -9494,8 +9966,6 @@ export function HyperframesWorkbench({
                     selectedId={selectedAudioId}
                     usable={audioOps.clipUsable}
                     onPatch={audioOps.patchClip}
-                    soloId={audioOps.soloId}
-                    onSolo={audioOps.setSoloId}
                     peakOf={(c) =>
                       c.sig ? (audioOps.clipPeaks.get(c.sig) ?? null) : null
                     }
@@ -9538,6 +10008,16 @@ export function HyperframesWorkbench({
                       <CaptionsPanel {...captionsPanelProps()} />
                     </div>
                   </div>
+                )}
+                {!floatWin && libTab === "text" && (
+                  <DisplayTextPanel
+                    block={selectedDisplayTextBlock}
+                    onAdd={insertDisplayText}
+                    onPatch={patchDisplayText}
+                    onPreset={(preset: DisplayTextPresetId, animation: DisplayTextAnimationId) =>
+                      patchDisplayText({ preset, animation })
+                    }
+                  />
                 )}
                 {!floatWin && libTab === "gen" && (
                   <div className="flex min-h-0 flex-1 flex-col">
@@ -9693,6 +10173,8 @@ export function HyperframesWorkbench({
                           onSetFilter={setShotFilter}
                           onPreviewFilter={previewShotFilter}
                           onSetAudio={setShotAudio}
+                          speed={clipSpeedInDocument(editorDocument, selectedShot.id)}
+                          onSetSpeed={setShotSpeed}
                         />
                       </div>
                     )}
@@ -9841,6 +10323,7 @@ export function HyperframesWorkbench({
                         icon: Captions,
                         label: "panels.captions",
                       },
+                      { v: "text", icon: Type, label: "displayText.title" },
                       { v: "audio", icon: Music, label: "panels.music" },
                       { v: "gen", icon: Sparkles, label: "common.generate" },
                       {
@@ -9854,6 +10337,7 @@ export function HyperframesWorkbench({
                         | "assets"
                         | "script"
                         | "captions"
+                        | "text"
                         | "audio"
                         | "gen"
                         | "avatar";
@@ -9960,6 +10444,19 @@ export function HyperframesWorkbench({
                 <TooltipContent>{t("workbench.redoShortcut")}</TooltipContent>
               </Tooltip>
               <div className="bg-line mx-0.5 h-4 w-px shrink-0" />
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => insertDisplayText("clean")}
+                    aria-label={t("displayText.add")}
+                    className="text-ink-3 hover:text-ink hover:bg-panel-2 flex h-7 min-w-7 items-center justify-center rounded px-1.5 font-serif text-[15px] font-bold"
+                  >
+                    T
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent>{t("displayText.addAtPlayhead")}</TooltipContent>
+              </Tooltip>
               <Tooltip>
                 <TooltipTrigger asChild>
                   <button
@@ -10352,6 +10849,7 @@ export function HyperframesWorkbench({
             selectedBlockIds={selectedBlockIds}
             filmstrip={filmstrip}
             clipStrips={clipStrips}
+            onFilmstripDemandChange={setTimelineFilmstripDemand}
             mainLive
             srcLive={srcLive}
             pps={pps}
@@ -10369,6 +10867,7 @@ export function HyperframesWorkbench({
             disabledClipIds={disabledClipIds}
             audioPeaks={audioOps.audioPeaks}
             sourcePeaks={audioOps.sourcePeaks}
+            shotSourceDurations={shotSourceDurations}
             clipPendingAt={clipPending}
             {...timelineCbs}
           />

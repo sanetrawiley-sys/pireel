@@ -117,11 +117,13 @@ export interface StudioChatHandle {
 }
 
 export interface StudioChatProps {
+  /** Billing attribution: which project this chat edits (rides every charged request). */
+  projectId?: string;
   /** Client-side tool executor: mutates Composition state / calls compose to generate blocks, returns a summary. */
   runTool: (
     toolId: string,
     input: Record<string, unknown>,
-    opts?: { signal?: AbortSignal; surface?: "chat" | "bridge" },
+    opts?: { signal?: AbortSignal; surface?: "chat" | "bridge"; skillId?: string },
   ) => Promise<StudioToolResult>;
   /** Callback when a frame is attached (both panel "use" and the theme button): the workbench uses it to apply the theme palette to comp. */
   onFrameApplied?: (frame: AttachedFrame | null) => void;
@@ -133,6 +135,7 @@ export interface StudioChatProps {
   /** Live composition accessor (stable identity, reads a ref): tool receipt cards preview blocks
    *  without linking chat re-renders to comp state. Optional — the preview strip hides without it. */
   getComp?: () => Composition;
+  /** Output fps for surfaces that must convert v3 frames to seconds before execution (editorial assembly). */
   /** Exact-frame picking happens on the real Studio timeline; Chat only owns its mode button and draft attachment. */
   timelineFramePickActive?: boolean;
   timelineFramePickBusy?: boolean;
@@ -144,6 +147,8 @@ export interface StudioChatProps {
   onThreadChange?: (thread: StoredThread) => void;
   /** Close the chat area (header X; workbench collapses the right region to free up screen). Omit to not render the close button. */
   onClose?: () => void;
+  /** Streaming/tool-running state of the active thread (workbench pauses output switching while true). */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 /* ============================ Multi-session shell ============================ */
@@ -155,6 +160,7 @@ export interface StudioChatProps {
 export const StudioChat = memo(
   forwardRef<StudioChatHandle, StudioChatProps>(function StudioChat(
     {
+      projectId,
       runTool,
       getBody,
       elements,
@@ -167,6 +173,7 @@ export const StudioChat = memo(
       initialThreads,
       onThreadChange,
       onClose,
+      onBusyChange,
     },
     ref,
   ) {
@@ -178,6 +185,11 @@ export const StudioChat = memo(
     const [customScenarioSkillsReady, setCustomScenarioSkillsReady] = useState(
       !customScenarioSkillManager,
     );
+    const refreshCustomScenarioSkills = useCallback(async () => {
+      if (!customScenarioSkillManager) return;
+      const skills = await customScenarioSkillManager.list();
+      setCustomScenarioSkills(skills);
+    }, [customScenarioSkillManager]);
     const scenarioSkills = useMemo(() => {
       const host = shell.scenarioSkills ?? [];
       const hostIds = new Set(host.map((skill) => skill.id));
@@ -240,20 +252,6 @@ export const StudioChat = memo(
         setActiveId(loaded[0]!.id);
       }
     }, [customScenarioSkillsReady, initialThreads, scenarioSkills]);
-
-    const importScenarioSkill = useCallback(
-      async (file: File) => {
-        if (!customScenarioSkillManager)
-          throw new Error("skill_import_unavailable");
-        const imported = await customScenarioSkillManager.importMarkdown(file);
-        setCustomScenarioSkills((current) => [
-          imported,
-          ...current.filter((skill) => skill.id !== imported.id),
-        ]);
-        return imported;
-      },
-      [customScenarioSkillManager],
-    );
 
     const deleteScenarioSkill = useCallback(
       async (id: string) => {
@@ -411,13 +409,15 @@ export const StudioChat = memo(
 
         <ChatThread
           key={activeId}
+          projectId={projectId}
           threadId={activeId}
           initialMessages={restoredMessages}
           initialFrame={active?.frame ?? null}
           initialSkillId={active?.skillId ?? defaultSkillId}
           scenarioSkills={scenarioSkills}
-          onImportScenarioSkill={
-            customScenarioSkillManager ? importScenarioSkill : undefined
+          onOpenSkillMarket={customScenarioSkillManager?.openMarket}
+          onRefreshScenarioSkills={
+            customScenarioSkillManager ? refreshCustomScenarioSkills : undefined
           }
           onDeleteScenarioSkill={
             customScenarioSkillManager ? deleteScenarioSkill : undefined
@@ -433,6 +433,7 @@ export const StudioChat = memo(
           timelineFramePickAvailable={timelineFramePickAvailable}
           onTimelineFramePickActiveChange={onTimelineFramePickActiveChange}
           onSnapshot={onSnapshot}
+          onBusyChange={onBusyChange}
           handleRef={innerRef}
         />
       </div>

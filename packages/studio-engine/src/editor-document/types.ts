@@ -33,6 +33,8 @@ export interface EditorMediaAsset {
     description?: string;
     tags?: string[];
     collection?: string;
+    /** Exact spoken text of a synthesised speech asset. ASR only ever measures timing against it. */
+    transcriptText?: string;
     /** Optional precomputed/declared musical grid metadata; media-byte analysis stays outside the document. */
     bpm?: number;
     beatOffsetSec?: number;
@@ -174,7 +176,7 @@ export interface CaptionTimelineClip extends TimelineClipBase {
   anchor: TimelineAnchor;
 }
 
-export type AudioClipProperties = Omit<AudioClip, 'id' | 'src' | 'sig' | 'durationSec' | 'startSec' | 'inSec' | 'outSec'>;
+export type AudioClipProperties = Omit<AudioClip, 'id' | 'src' | 'sig' | 'durationSec' | 'startSec' | 'inSec' | 'outSec' | 'role'>;
 
 export interface AudioTimelineClip extends TimelineClipBase {
   kind: 'audio';

@@ -45,6 +45,7 @@ import {
   type VideoShotTimelinePlacement,
   assembleHtml,
   cutTransitions,
+  displayTextLocalFontFamily,
   parseClipInset,
   localImageLocator,
   localImageLocatorSigs,
@@ -75,6 +76,7 @@ import { createGlMixer, glDirection } from '@pireel/studio-engine/transition-gl'
 import { injectPreviewRuntime } from './sample-composition';
 import { materializeRemoteMedia } from './remote-media';
 import { buildInlineFontCss } from './export-fonts';
+import { webFontIdOf } from '@pireel/studio-engine/font-library';
 import { t } from './i18n';
 import {
   browserVisualLayerPlan,
@@ -96,6 +98,26 @@ export const DEFAULT_RENDER_OPTS: ExportRenderOpts = { res: 1080, fps: 30, forma
 function assertExportableComposition(comp: Composition): void {
   const issues = validateComposition(comp);
   if (issues.length) throw new Error(`Invalid composition: ${issues.slice(0, 3).map((issue) => `${issue.path} ${issue.message}`).join('; ')}`);
+}
+
+/** Every font id a composition renders with: display-text blocks AND the caption layer (main + translation line). */
+function compositionFontIds(comp: Composition): unknown[] {
+  return [
+    ...comp.blocks.map((block) => block.slots.fontFamily),
+    comp.captionStyle?.font,
+    comp.captionStyle?.sub?.font,
+  ];
+}
+
+function compositionLocalFontFamilies(comp: Composition): string[] {
+  return [...new Set(compositionFontIds(comp)
+    .map((value) => displayTextLocalFontFamily(value))
+    .filter((family): family is string => family !== null))];
+}
+
+function compositionWebFontIds(comp: Composition): string[] {
+  return [...new Set(compositionFontIds(comp)
+    .filter((value): value is string => typeof value === 'string' && webFontIdOf(value) !== null))];
 }
 
 /* ============================ Sources and segments ============================ */
@@ -468,7 +490,12 @@ export async function captureCompositionFrame(opts: {
   }
   try {
     await inlineImages(overlay.root);
-    const fontCss = await buildInlineFontCss(overlay.root.textContent ?? '');
+    const fontCss = await buildInlineFontCss(
+      overlay.root.textContent ?? '',
+      undefined,
+      compositionLocalFontFamilies(comp),
+      compositionWebFontIds(comp),
+    );
     const css = `${fontCss}\n${overlay.headCss}\n#root{background:transparent !important;}`;
     overlay.win.__hfPreview!.seekTimelines(t);
     const el = overlay.doc.getElementById('vidEl');
@@ -685,7 +712,12 @@ export async function clientExportVideo(opts: ClientExportOpts): Promise<Blob> {
   }
   try {
     await inlineImages(overlay.root);
-    const fontCss = await buildInlineFontCss(overlay.root.textContent ?? '');
+    const fontCss = await buildInlineFontCss(
+      overlay.root.textContent ?? '',
+      undefined,
+      compositionLocalFontFamilies(comp),
+      compositionWebFontIds(comp),
+    );
     const css = `${fontCss}\n${overlay.headCss}\n#root{background:transparent !important;}`;
     // Layout coordinate system is always comp's W×H (font-size calibration unchanged); device size =
     // output outW×outH → vectors rasterize crisply at 4K

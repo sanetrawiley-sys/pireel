@@ -156,7 +156,7 @@ export const PANELS_EN: Record<string, string> = {
   "panels.loopElementSTime":
     "Loop this element's time range (handy for tuning animation)",
   "panels.musicDurationHint":
-    "A target, not a contract — under 30s buys the cheaper short-clip tier",
+    "A target, not a contract — the model produces at least ~30s; trim on the timeline for shorter",
   "panels.hideTrack": "Hide this track",
   "panels.muteTrack": "Mute this track",
   "panels.nShotsSelected": "{n} shots selected",
@@ -231,6 +231,11 @@ export const PANELS_EN: Record<string, string> = {
     "Restored {restored}/{total} assets; the rest may have moved or changed",
   "panels.folderRestoreNone":
     "No matching assets found — choose the original folder",
+  "panels.duplicateImportsSkipped": "Skipped {n} duplicate assets",
+  "panels.slipFirstFrame": "First frame",
+  "panels.slipLastFrame": "Last frame",
+  "panels.slipWindow": "Slip window",
+  "panels.slipWindowOpen": "Slip window: choose which part of the source this shot plays",
   "panels.localVideoOnly": "Unsupported file type (video, image, or audio)",
   "panels.officialPreparing": "Content coming soon",
   "panels.musicBed": "Audio track",
@@ -243,9 +248,6 @@ export const PANELS_EN: Record<string, string> = {
   "panels.removeMusic": "Remove track",
   "panels.selectShotOrAudioFirst":
     "Select a shot or an audio clip on the timeline first",
-  "panels.soloListen": "Solo",
-  "panels.soloListenHint":
-    "Monitoring this clip alone — footage and other audio are quiet for now; export is unaffected",
   "panels.trackMutedHint":
     "This track is muted — unmute it from the icon in front of the track",
   "panels.unmuteTrack": "Unmute",
@@ -451,7 +453,7 @@ export const PANELS_EN: Record<string, string> = {
   "panels.smartCutoutToggle": "Smart cutout toggle",
   "panels.softEdgedDiagonalWipe": "Soft-edged diagonal wipe",
   "panels.solid": "Solid",
-  "panels.speedPitchNote": "Speed also shifts pitch (matches the export)",
+  "panels.speedPitchNote": "Speed keeps the pitch (matches the export)",
   "panels.speedRate": "Speed",
   "panels.stickers": "Stickers",
   "panels.still5s": "5s still",

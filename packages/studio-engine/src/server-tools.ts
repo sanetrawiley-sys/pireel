@@ -17,6 +17,8 @@
  * route's job; this just takes data and returns data, directly pinnable by vitest.
  */
 
+import { documentDelta, renderV3State } from './agent-surface-v3/state';
+import { resolveWebFontReference, webFontCatalogHint } from './font-library';
 import { interpretApplyRaw } from './briefs';
 import { placementPercentToBox } from './overlay-placement';
 import { formatDirectorSceneContext, resolveDirectorSceneContext } from './semantic-scenes';
@@ -59,6 +61,7 @@ import {
   removeNarrationClipsWithoutRipple,
   removeAudioDocumentClips,
   removeOverlayDocumentClips,
+  retimeOverlayDocumentClip,
   duplicateOverlayDocumentClip,
   freezeEditorDocumentBlockVars,
   insertOverlayDocumentClip,
@@ -111,11 +114,15 @@ import type { StudioProjectContext, TranscriptSegment } from './project-dto';
 import { type CutSeamEntry, finalizeCutSeams, narrationRowMarks, spans as clipSpans, tightenCutRanges } from './trim';
 import { type AsrSegment, applyCaptionTranslations, clearCaptionTranslations, desegmentCues } from './build-blocks';
 import { beatsForWindow } from './captions-relay';
+import { captionYPctForCanvas } from './delivery-safety';
 import { applyCaptionTextEdits } from './caption-text-edit';
 import { ensureTemplatesRegistered } from './templates';
 import { mediaSearchTranscriptsFromDocument, searchProjectMedia } from './media-search';
 import { normalizeProjectOutputs, projectOutputPositionMap } from './project-outputs';
 import { AGENT_TIMELINE_TOOL_IDS, runAgentTimelineTool } from './agent-timeline';
+import { planScriptCaptionSegments, splitScriptLines } from './script-captions';
+import { isDisplayTextFontId } from './display-text-presets';
+import { describeAudioTargets, resolveAudioTarget } from './audio-target';
 
 // Ensure the template registry is ready at module load. The MCP worker path
 // doesn't go through UI mounting; this un-tree-shakeable call pulls templates.ts
@@ -135,6 +142,9 @@ export interface ServerToolProject {
   /** Credits guardrail for the snapshot: hosted generation affordable? Boolean by design (never the balance
    *  number); route fills it for get_state from the billing store. Absent = line omitted. */
   canGenerate?: boolean;
+  /** Receipt vocabulary. `v3` returns get_state in the v3 shape and mutation receipts with a document-level
+   *  delta (frames, clips, shifted rules, notes); default keeps the legacy composition receipt. */
+  receipt?: 'legacy' | 'v3';
 }
 
 /** Execution result: result goes back to MCP; comp/context present = a change happened, route persists it (version+1). */
@@ -378,6 +388,17 @@ function offlineTranscript(p: ServerToolProject): string {
 
 /** Execute one offline tool. Filter through SERVER_EXECUTABLE_TOOLS before calling. */
 export function runServerTool(tool: string, input: Record<string, unknown>, p: ServerToolProject): ServerToolOutcome {
+  if (p.receipt === 'v3' && tool === 'get_state') {
+    const window = input.window && typeof input.window === 'object' ? (input.window as { tracks?: string[]; fromFrame?: number; toFrame?: number }) : undefined;
+    const state = renderV3State(p.document, window ? { window } : {});
+    return {
+      result: {
+        ok: true,
+        summary: `OFFLINE MODE · project "${p.title}" · ${state.tracks.length} tracks · ${state.durationFrames} frames @ ${state.canvas.fps}fps`,
+        data: { ...state, project: { id: p.id, title: p.title }, offline: true, ...(p.canGenerate != null ? { canGenerate: p.canGenerate } : {}) },
+      },
+    };
+  }
   const out = runServerToolInner(tool, input, p);
   // Insertion-time look freeze remains a native document operation. Composition below is only the
   // read receipt returned to older tool clients.
@@ -423,7 +444,9 @@ export function runServerTool(tool: string, input: Record<string, unknown>, p: S
       };
     }
     // Every successful composition mutation reports its actual compact diff, not just cutting tools.
-    const delta = compReceiptDelta(projectDocumentToComposition(p.document), next);
+    const delta = p.receipt === 'v3'
+      ? documentDelta(p.document, out.document)
+      : compReceiptDelta(projectDocumentToComposition(p.document), next);
     if (delta) out.result.data = { ...((out.result.data as Record<string, unknown> | undefined) ?? {}), delta };
   }
   return out;
@@ -587,7 +610,7 @@ function runServerToolInner(tool: string, input: Record<string, unknown>, p: Ser
       const s = Number(input.startSec);
       if (!Number.isFinite(s)) return { result: { ok: false, error: 'invalid startSec' } };
       const start = Math.max(0, Math.round(s * 100) / 100);
-      const edit = applyOverlayDocumentEdits({ document: p.document, updates: [{ clipId: b.id, startSec: start }] });
+      const edit = retimeOverlayDocumentClip({ document: p.document, clipId: b.id, startSec: start });
       if (!edit.ok) return { result: { ok: false, error: edit.error.message, data: { code: edit.error.code, trackIds: edit.error.trackIds } } };
       return {
         result: { ok: true, summary: `Moved "${bname(b)}" to ${r1(start)}s` },
@@ -603,10 +626,7 @@ function runServerToolInner(tool: string, input: Record<string, unknown>, p: Ser
       if (!Number.isFinite(s) || !Number.isFinite(d)) return { result: { ok: false, error: 'invalid startSec/durationSec' } };
       const start = Math.max(0, Math.round(s * 100) / 100);
       const dur = Math.max(0.3, Math.round(d * 100) / 100);
-      const edit = applyOverlayDocumentEdits({
-        document: p.document,
-        updates: [{ clipId: b.id, startSec: start, durationSec: dur }],
-      });
+      const edit = retimeOverlayDocumentClip({ document: p.document, clipId: b.id, startSec: start, durationSec: dur });
       if (!edit.ok) return { result: { ok: false, error: edit.error.message, data: { code: edit.error.code, trackIds: edit.error.trackIds } } };
       return {
         result: { ok: true, summary: `Resized "${bname(b)}" to ${r1(start)}–${r1(start + dur)}s` },
@@ -868,10 +888,15 @@ function runServerToolInner(tool: string, input: Record<string, unknown>, p: Ser
         ...(typeof input.startSec === 'number' && Number.isFinite(input.startSec) ? { startSec: Math.max(0, input.startSec) } : {}),
         ...(typeof input.mute === 'boolean' ? { muted: input.mute } : {}),
       };
+      // trackId = an audio clip id OR a lane id (track_music …): a lane resolves to the audio
+      // clips on it. An unknown id names what would have worked so the retry is exact.
+      const audioIds = tracks.map((x) => x.id);
+      const resolved = trackIdIn ? resolveAudioTarget(p.document, audioIds, trackIdIn) : null;
+      const notFound = `audio track not found: ${trackIdIn} — ${describeAudioTargets(p.document, audioIds)}`;
       if (input.off === true) {
           if (!tracks.length) return { result: { ok: false, error: 'no audio tracks yet' } };
-          if (trackIdIn && !tracks.some((x) => x.id === trackIdIn)) return { result: { ok: false, error: 'audio track not found' } };
-          const removed = removeAudioDocumentClips(p.document, trackIdIn ? [trackIdIn] : tracks.map((track) => track.id));
+          if (resolved && !resolved.clipIds.length) return { result: { ok: false, error: notFound } };
+          const removed = removeAudioDocumentClips(p.document, resolved ? resolved.clipIds : audioIds);
           if (!removed.ok) return { result: { ok: false, error: removed.error.message, data: { code: removed.error.code, trackIds: removed.error.trackIds } } };
           return {
             result: { ok: true, summary: trackIdIn ? 'Removed the audio track' : 'Removed all audio tracks' },
@@ -890,9 +915,13 @@ function runServerToolInner(tool: string, input: Record<string, unknown>, p: Ser
             document: added.document,
           };
       }
-      const target = trackIdIn ? tracks.find((x) => x.id === trackIdIn) : tracks.length === 1 ? tracks[0] : null;
       if (!tracks.length) return { result: { ok: false, error: 'no audio tracks yet — pass a url to add one' } };
-      if (!target) return { result: { ok: false, error: 'pass trackId (several tracks exist)' } };
+      if (resolved && !resolved.clipIds.length) return { result: { ok: false, error: notFound } };
+      if (resolved && resolved.clipIds.length > 1) {
+        return { result: { ok: false, error: `${resolved.laneId} holds ${resolved.clipIds.length} clips — pass one clip id: ${resolved.clipIds.join(', ')}` } };
+      }
+      const target = resolved ? tracks.find((x) => x.id === resolved.clipIds[0]) : tracks.length === 1 ? tracks[0] : null;
+      if (!target) return { result: { ok: false, error: `pass trackId (several tracks exist) — ${describeAudioTargets(p.document, audioIds)}` } };
       const splitAt = Number(input.splitAtSec);
       if (Number.isFinite(splitAt)) {
           const split = splitAudioDocumentClip(p.document, target.id, splitAt);
@@ -1170,11 +1199,53 @@ function runServerToolInner(tool: string, input: Record<string, unknown>, p: Ser
     case 'set_captions': {
       const preset = typeof input.preset === 'string' ? input.preset : undefined;
       if (preset && !CAPTION_PRESETS.some((x) => x.id === preset)) return { result: { ok: false, error: `no such caption preset: ${preset}` } };
-      const yPct = Number(input.yPct);
+      const yPct = captionYPctForCanvas(p.document.canvas, input.yPct);
       const scale = Number(input.scale);
-      const patch: Record<string, number> = {};
-      if (Number.isFinite(yPct)) patch.yPct = yPct;
+      const patch: Record<string, number | string | undefined> = {};
+      if (yPct != null) patch.yPct = yPct;
       if (Number.isFinite(scale)) patch.scale = scale;
+      if (typeof input.font === 'string') {
+        if (input.font === 'preset') patch.font = undefined;
+        else if (isDisplayTextFontId(input.font)) patch.font = input.font;
+        else if (resolveWebFontReference(input.font)) patch.font = resolveWebFontReference(input.font)!;
+        else return { result: { ok: false, error: `unknown caption font: ${input.font}. Use sans | serif | mono | local:<family> | preset, or a library font by id or name: ${webFontCatalogHint()}` } };
+      }
+      const script = typeof input.script === 'string' ? input.script.trim() : '';
+      if (script) {
+        // Silent montage: the copy becomes transcript truth of the placed picture clips (see
+        // script-captions.ts). Document-side shots are the primary lane's narrative clips; the
+        // lane is selected explicitly because automatic selection rightly skips muted clips.
+        const lines = splitScriptLines(script);
+        if (!lines.length) return { result: { ok: false, error: 'script is empty: provide the lines to show' } };
+        const trackId = p.document.semantics.primaryNarrativeTrackId;
+        const primary = trackId ? p.document.timeline.tracks.find((track) => track.id === trackId) : undefined;
+        const shots = [...(primary?.clips ?? [])]
+          .filter((clip) => clip.kind === 'narrative' && clip.enabled !== false)
+          .sort((left, right) => left.startFrame - right.startFrame)
+          .map((clip) => (clip.kind === 'narrative'
+            ? { src: clip.assetId, srcStart: clip.sourceInSec, srcEnd: clip.sourceOutSec }
+            : { srcStart: 0, srcEnd: 0 }));
+        if (!trackId || !shots.length) return { result: { ok: false, error: 'no picture clips on the timeline can carry captions: assemble the picture first' } };
+        const plan = planScriptCaptionSegments(shots, lines);
+        const edit = applyCaptionDocumentEdit({
+          document: p.document,
+          patch: { on: true, ...(preset ? { preset, color: undefined, bg: undefined } : {}), ...patch },
+          source: { mode: 'track', trackId },
+          mainTranscript: null,
+          clipTranscripts: plan.clips,
+        });
+        if (!edit.ok) return { result: { ok: false, error: edit.error.message, data: { code: edit.error.code, trackIds: edit.error.trackIds } } };
+        const captionTrack = edit.document.semantics.managedCaptionTrackId
+          ? edit.document.timeline.tracks.find((track) => track.id === edit.document.semantics.managedCaptionTrackId)
+          : undefined;
+        if (!captionTrack?.clips.length) return { result: { ok: false, error: 'no picture clip could carry the script (sources without an audio track cannot hold transcript truth)' } };
+        const comp = projectDocumentToComposition(edit.document);
+        return {
+          result: { ok: true, summary: `Captions laid from the script: ${plan.lineCount} lines`, data: { source: 'script', lines: plan.lineCount } },
+          comp,
+          document: edit.document,
+        };
+      }
       if (!preset && !Object.keys(patch).length) return { result: { ok: false, error: 'nothing to set: provide at least one of preset / yPct / scale' } };
       const sourceDocument = p.document;
       const source = input.source === 'track' && typeof input.trackId === 'string'

@@ -4,7 +4,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Check, X, Loader2 } from 'lucide-react';
-import { STUDIO_TOOL_MAP, type StudioToolDef, type StudioToolResult } from '@pireel/studio-engine/prompts';
+import { type StudioToolDef, type StudioToolResult } from '@pireel/studio-engine/prompts';
+import { studioToolDefFor } from './v3-tool-defs';
 import type { Composition } from '@pireel/studio-engine/composition';
 import { useToolProgress } from './tool-progress';
 import { CutListCard, cutRowsOf } from './chat-cut-list';
@@ -57,6 +58,16 @@ const PREVIEW_TOOLS = new Set(['add_block', 'edit_block', 'duplicate_block']);
 function toolIdOf(part: ToolPartLike): string {
   if (part.type === 'dynamic-tool') return part.toolName ?? '';
   return part.type.startsWith('tool-') ? part.type.slice(5) : part.type;
+}
+
+export function analyzeVisualSourceLabel(part: ToolPartLike): string {
+  const output = part.output && typeof part.output === 'object'
+    ? part.output as { data?: unknown }
+    : null;
+  const data = output?.data && typeof output.data === 'object'
+    ? output.data as { label?: unknown }
+    : null;
+  return typeof data?.label === 'string' ? data.label.trim().slice(0, 120) : '';
 }
 
 function SpeechAssetBody({ output }: { output: unknown }) {
@@ -127,6 +138,7 @@ function ToolCard({ def, part, children }: { def: StudioToolDef; part: ToolPartL
   const prog = useToolProgress(def.id);
   const live = running ? prog : null;
   const instruction = typeof part.input?.instruction === 'string' ? (part.input.instruction as string) : '';
+  const contextLabel = def.id === 'analyze_visual' ? analyzeVisualSourceLabel(part) : instruction;
 
   // Elapsed (clock starts once running is observed, ticks every 0.5s); on completion, record into the historical EMA
   const startRef = useRef<number | null>(null);
@@ -167,7 +179,7 @@ function ToolCard({ def, part, children }: { def: StudioToolDef; part: ToolPartL
       <div className="flex items-center gap-2 px-2.5 py-1.5">
         <span className="text-accent grid h-5 w-5 shrink-0 place-items-center rounded bg-accent/10 text-[12px]">{def.icon}</span>
         <span className="text-ink-2 shrink-0 text-[12px] font-semibold">{t(def.label)}</span>
-        {instruction && <span className="text-ink-4 truncate text-[12px]">{instruction}</span>}
+        {contextLabel && <span className="text-ink-4 truncate text-[12px]">{contextLabel}</span>}
         <span className={`ml-auto inline-flex min-w-0 shrink-0 items-center gap-1.5 text-[11px] ${st.kind === 'error' ? 'text-destructive' : 'text-ink-3'}`}>
           {running ? <Loader2 size={11} className="animate-spin" /> : st.kind === 'error' ? <X size={11} /> : <Check size={11} />}
           {running && <span className="tabular-nums">{timeText || t('chatGen.starting')}</span>}
@@ -181,8 +193,25 @@ function ToolCard({ def, part, children }: { def: StudioToolDef; part: ToolPartL
       )}
       {/* Running: stage-text body row (stream note > progress text > default busy text), multi-line readable */}
       {running && (
-        <div className="border-line/70 text-ink-3 line-clamp-3 border-t px-2.5 py-1.5 text-[12px] leading-relaxed">
-          {live?.text || (def.busyText ? t(def.busyText) : t('chatGen.running'))}
+        <div className="border-line/70 text-ink-3 border-t px-2.5 py-1.5 text-[12px] leading-relaxed">
+          <div className="line-clamp-3">{live?.text || (def.busyText ? t(def.busyText) : t('chatGen.running'))}</div>
+          {live?.items?.length ? (
+            <div className="border-line/70 mt-2 max-h-52 space-y-1.5 overflow-y-auto border-t pt-2">
+              {live.items.map((item) => {
+                const fraction = Math.max(0, Math.min(1, item.frac));
+                const done = fraction >= 1;
+                return (
+                  <div key={item.id} className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1">
+                    <span className="text-ink-2 truncate" title={item.label}>{item.label}</span>
+                    <span className="text-ink-4 tabular-nums">{done ? <Check size={11} /> : `${Math.round(fraction * 100)}%`}</span>
+                    <div className="bg-line/50 col-span-2 h-0.5 overflow-hidden rounded-full">
+                      <div className="bg-accent h-full transition-[width] duration-200" style={{ width: `${Math.round(fraction * 100)}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       )}
       {/* Tool-specific extra body (e.g. a component preview strip) */}
@@ -204,15 +233,17 @@ function ToolCard({ def, part, children }: { def: StudioToolDef; part: ToolPartL
 
 export function renderToolPart(part: ToolPartLike, key: string, opts?: { onLocate?: (sec: number) => void; getComp?: () => Composition }): React.ReactNode {
   const id = toolIdOf(part);
-  const def = STUDIO_TOOL_MAP[id];
+  const def = studioToolDefFor(id);
   if (!def) return null;
-  // ask_user: a structured question with clickable option chips (its own card, not the generic one)
+  // ask_user: a structured question with clickable option chips (its own card, not the generic one).
+  // On the v3 surface kind=approval is the approval boundary and parks on the approval channel.
+  if (id === 'ask_user' && (part.input as { kind?: unknown } | undefined)?.kind === 'approval') return <div key={key}><ApprovalCard part={part} /></div>;
   if (id === 'ask_user') return <div key={key}><AskUserCard part={part} /></div>;
   // request_approval: model-authored proposal, host-owned generic Reject / Approve boundary
   if (id === 'request_approval') return <div key={key}><ApprovalCard part={part} /></div>;
-  // Charge-bearing Foley/TTS tools park on the same host-owned approval channel after quoting.
-  // While active, render the parked payload rather than an invisible generic busy card.
-  if ((id === 'generate_foley' || id === 'generate_speech')
+  // Foley parks on the host-owned approval channel after quoting. While active, render the
+  // parked payload rather than an invisible generic busy card. Speech generation runs directly.
+  if (id === 'generate_foley'
     && (part.state === 'input-available' || part.state === 'input-streaming')) {
     return <div key={key}><ApprovalCard part={part} /></div>;
   }
