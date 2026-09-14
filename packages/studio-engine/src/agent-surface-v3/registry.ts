@@ -43,7 +43,7 @@ export const V3_TOOLS: readonly V3ToolSpec[] = [
     replaces: ['list_projects', 'switch_project', 'create_project', 'rename_project', 'create_output', 'duplicate_output', 'switch_output', 'rename_output', 'delete_output'],
   },
   // ---- assets (7)
-  { id: 'search_assets', group: 'assets', serverDirect: true, replaces: ['list_assets', 'search_assets', 'search_stock'] },
+  { id: 'search_assets', group: 'assets', serverDirect: true, replaces: ['list_assets', 'search_assets', 'search_stock', 'search_fonts'] },
   { id: 'register_media', group: 'assets', serverDirect: true, replaces: ['register_media', 'import_stock'] },
   { id: 'import_media', group: 'assets', serverDirect: true, replaces: ['import_media', 'insert_clip'] },
   { id: 'organize_media', group: 'assets', replaces: ['organize_media'] },
@@ -67,9 +67,10 @@ export const V3_TOOLS: readonly V3ToolSpec[] = [
   { id: 'manage_clip_links', group: 'clips', replaces: ['manage_clip_links', 'sync_clips'] },
   { id: 'add_transition', group: 'clips', replaces: ['add_transition'] },
   { id: 'set_canvas', group: 'clips', replaces: ['set_canvas'] },
-  // ---- speech (3)
+  // ---- speech (4)
   { id: 'remove_silence', group: 'speech', replaces: ['remove_silence'] },
   { id: 'remove_words', group: 'speech', replaces: ['cut_narration', 'delete_words'] },
+  { id: 'mask_words', group: 'speech', replaces: ['mask_words'] },
   { id: 'denoise_audio', group: 'speech', replaces: ['denoise_audio'] },
   // ---- components and text (5)
   { id: 'compose_component', group: 'components', replaces: ['compose_block_brief'] },
@@ -103,7 +104,7 @@ export const V3_RETIRED_TOOL_IDS: readonly string[] = [
   'read_scene_designs',
 ];
 
-export const V3_TOOL_LIMIT = 51;
+export const V3_TOOL_LIMIT = 52;
 
 export const V3_TOOL_IDS: ReadonlySet<string> = new Set(V3_TOOLS.map((tool) => tool.id));
 

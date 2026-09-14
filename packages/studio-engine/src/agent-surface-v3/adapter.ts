@@ -137,6 +137,8 @@ function translateGetTranscript(input: Input, ctx: V3AdapterContext): V3Translat
     return { status: 'ok', calls: [{ tool: 'read_script', input: call }] };
   }
   const call: Input = {};
+  if (isNonEmptyString(input.assetId)) call.assetId = input.assetId;
+  if (isNonEmptyString(input.trackId)) call.trackId = input.trackId;
   if (isNonEmptyString(input.clipId)) call.shotId = input.clipId;
   if (Array.isArray(input.segmentIndexes)) call.sentenceIndexes = input.segmentIndexes;
   const from = frameField(input, 'fromFrame', ctx);
@@ -529,6 +531,15 @@ function translateInspectMedia(input: Input, ctx: V3AdapterContext): V3Translati
 }
 
 function translateSearchAssets(input: Input): V3Translation {
+  if (input.kind === 'font') {
+    // Fonts are a catalog, not a library scope: one pure server-direct lookup.
+    const call: Input = {};
+    if (isNonEmptyString(input.query)) call.query = input.query.trim();
+    if (isNonEmptyString(input.script)) call.script = input.script;
+    if (isNonEmptyString(input.category)) call.category = input.category;
+    if (isFiniteNumber(input.limit)) call.limit = input.limit;
+    return { status: 'ok', calls: [{ tool: 'search_fonts', input: call }] };
+  }
   const scope = input.scope ?? 'mine';
   const allowed = ['mine', 'cloud', 'official', 'all', 'stock'];
   if (typeof scope !== 'string' || !allowed.includes(scope)) return { status: 'error', error: 'invalid_value', path: 'scope', value: scope, allowed };
@@ -740,6 +751,7 @@ function translateApplyComponent(input: Input, ctx: V3AdapterContext): V3Transla
   if (isNonEmptyString(input.clipId)) call.blockId = input.clipId;
   if (input.placement && typeof input.placement === 'object') call.placement = input.placement;
   if (isNonEmptyString(input.label)) call.label = input.label;
+  if (isNonEmptyString(input.fontFamily)) call.fontFamily = input.fontFamily;
   return { status: 'ok', calls: [{ tool: 'apply_block', input: call }] };
 }
 
@@ -792,6 +804,7 @@ const PASSTHROUGH: Record<string, string> = {
   set_keyframes: 'set_keyframes',
   set_canvas: 'set_canvas',
   remove_silence: 'remove_silence',
+  mask_words: 'mask_words',
   denoise_audio: 'denoise_audio',
   compose_component: 'compose_block_brief',
   list_models: 'list_models',

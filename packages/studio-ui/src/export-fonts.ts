@@ -8,7 +8,8 @@
  */
 
 import { registeredLocalFontFace } from './local-font-access';
-import { DEFAULT_CJK_PARTNER_ID, webFontCssUrl, webFontIdOf } from '@pireel/studio-engine/font-library';
+import { DEFAULT_CJK_PARTNER_ID, fontStylesheetUrlFor, webFontIdOf } from '@pireel/studio-engine/font-library';
+import { googleFontRowOf } from '@pireel/studio-engine/google-fonts';
 
 export interface FontFace {
   family: string;
@@ -57,6 +58,34 @@ export function parseFontFaces(css: string, baseUrl?: string): FontFace[] {
   return faces;
 }
 
+/**
+ * Markup that touches every inlined face with every glyph the export will draw.
+ *
+ * Each exported frame is a fresh SVG image document; its data: @font-face rules decode lazily, on
+ * first layout of text in that face. A frame painted before a face finished decoding shows the
+ * fallback font — the whole first frame, and later one character in one frame when a chunk (one
+ * unicode-range face) is first reached mid-video. Rasterizing this markup once up front pulls every
+ * face into the browser's font memory cache, so real frames only hit warm faces.
+ */
+export function warmupFontMarkup(fontCss: string, text: string): string {
+  const faces = new Map<string, { family: string; style: string; weight: string }>();
+  for (const m of fontCss.matchAll(/@font-face\{font-family:(['"])([^'"]+)\1;font-style:([^;]+);font-weight:([^;]+);/g)) {
+    const face = { family: m[2]!, style: m[3]!.trim(), weight: m[4]!.trim() };
+    faces.set(`${face.family}|${face.style}|${face.weight}`, face);
+  }
+  if (!faces.size) return '';
+  const glyphs = [...new Set([...text.replace(/\s+/gu, '')])].join('').slice(0, 2_000);
+  const sample = (glyphs + glyphs.toUpperCase() + glyphs.toLowerCase())
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const spans = [...faces.values()].map((face) => {
+    // A range like "200 700" needs one concrete weight to request; the middle keeps a variable face honest.
+    const weight = /^(\d+)\s+(\d+)$/.exec(face.weight);
+    const w = weight ? Math.round((Number(weight[1]) + Number(weight[2])) / 2) : face.weight;
+    return `<span style="font-family:'${face.family.replaceAll("'", '')}';font-style:${face.style};font-weight:${w};">${sample}</span>`;
+  });
+  return `<div xmlns="http://www.w3.org/1999/xhtml" style="position:absolute;left:0;top:0;width:100%;font-size:24px;line-height:1;white-space:pre-wrap;word-break:break-all;opacity:0.01;">${spans.join('')}</div>`;
+}
+
 function toBase64(buf: ArrayBuffer): string {
   const bytes = new Uint8Array(buf);
   let bin = '';
@@ -101,7 +130,7 @@ async function buildInlineLocalFontCss(
  * restricted in-app browsers too, and read-through-caches font binaries into R2). Direct fetch is
  * the fallback for shells with no backend (OSS). Returns null if both fail (degrade to system fonts).
  */
-async function fetchFont(url: string): Promise<Response | null> {
+async function fetchFontOnce(url: string): Promise<Response | null> {
   try {
     const r = await fetch(`/api/media/fetch?url=${encodeURIComponent(url)}`);
     if (r.ok) return r;
@@ -117,6 +146,18 @@ async function fetchFont(url: string): Promise<Response | null> {
   return null;
 }
 
+/** A chunked library face is dozens of small requests per export; one dropped connection used to
+ *  silently lose every glyph in that chunk (the text fell back to the system face for those
+ *  characters only, which reads as "the font came out half wrong"). Retry before giving up. */
+async function fetchFont(url: string, attempts = 3): Promise<Response | null> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const res = await fetchFontOnce(url);
+    if (res) return res;
+    if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 300 * attempt));
+  }
+  return null;
+}
+
 const rangeDecl = (f: FontFace) => (f.ranges
   ? `unicode-range:${f.ranges.map(([a, b]) => (a === b ? `U+${a.toString(16)}` : `U+${a.toString(16)}-${b.toString(16)}`)).join(',')};`
   : '');
@@ -128,10 +169,11 @@ async function buildInlineWebFontCss(
   used: Set<number>,
   log: (m: string) => void,
 ): Promise<string> {
-  const ids = [...new Set(webFontIds.map((id) => webFontIdOf(id) ?? '').filter(Boolean))];
+  // Library ids and google:<Family> ids alike: each resolves to one stylesheet whose @font-face rules are subset-tested.
+  const ids = [...new Set(webFontIds.filter((id) => webFontIdOf(id) !== null || googleFontRowOf(id) !== null))];
   if (!ids.length) return '';
   const parts = await Promise.all(ids.map(async (id) => {
-    const cssUrl = webFontCssUrl(id);
+    const cssUrl = fontStylesheetUrlFor(id)!;
     const res = await fetchFont(cssUrl);
     if (!res) {
       log(`web font css unavailable for export: ${id}`);
@@ -141,7 +183,10 @@ async function buildInlineWebFontCss(
     const kept = faces.filter((f) => !f.ranges || f.ranges.some(([lo, hi]) => { for (const cp of used) if (cp >= lo && cp <= hi) return true; return false; }));
     const rules = await Promise.all(kept.map(async (f) => {
       const buf = await fetchFont(f.url).then((response) => response?.arrayBuffer() ?? null).catch(() => null);
-      if (!buf) return '';
+      if (!buf) {
+        log(`web font chunk FAILED (glyphs in it fall back): ${id} ${f.url.split('/').pop()}`);
+        return '';
+      }
       return `@font-face{font-family:"${f.family}";font-style:${f.style};font-weight:${f.weight};src:url(data:font/woff2;base64,${toBase64(buf)}) format('woff2');${rangeDecl(f)}}`;
     }));
     log(`web font embedded: ${id} · ${rules.filter(Boolean).length} of ${faces.length} chunks`);
@@ -173,7 +218,9 @@ export async function buildInlineFontCss(
   for (const ch of glyphText) usedCodePoints.add(ch.codePointAt(0)!);
   // A local (usually Latin-only) face is rendered with the CJK partner behind it (see
   // font-library): the export must carry the partner's glyph blocks too.
-  const webIds = localFamilies.length ? [...webFontIds, `web:${DEFAULT_CJK_PARTNER_ID}`] : webFontIds;
+  // Local and Google faces both render with the CJK partner behind them: the export must carry its glyph blocks.
+  const partnerNeeded = localFamilies.length > 0 || webFontIds.some((id) => googleFontRowOf(id) !== null);
+  const webIds = partnerNeeded ? [...webFontIds, `web:${DEFAULT_CJK_PARTNER_ID}`] : webFontIds;
   const [localCss, webCss] = await Promise.all([
     buildInlineLocalFontCss(localFamilies, log),
     buildInlineWebFontCss(webIds, usedCodePoints, log),

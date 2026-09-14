@@ -41,6 +41,8 @@ import {
   BringToFront,
   ChevronUp,
   ChevronDown,
+  Layers,
+  MoreHorizontal,
   UserRound,
   AudioLines,
   Frame,
@@ -240,6 +242,7 @@ import {
   localAssetIndexEntry,
 } from "./local-import-session";
 import { VideoTrackEngine } from "./video-track-engine";
+import { clipAudioMasks, previewAudioMasks } from "./export-word-masks";
 import { segmentSourceRate } from "./video-segment-time";
 import { compositionRenderView } from "./composition-render-view";
 import { primaryNarrativeRenderPlan } from "./primary-render-plan";
@@ -321,6 +324,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@pireel/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@pireel/ui/dropdown-menu";
+import { BatchExportDialog, type OutputBatchState } from "./batch-export-dialog";
 import { GenChatPanel, type GenElementResult } from "./gen-chat-panel";
 import { KIT_INSERT_DURATION, kitSampleProps } from "./kit-ui";
 import { wordsFromText } from "@pireel/studio-engine/caption-fx";
@@ -401,6 +411,7 @@ import {
   TimeReadout,
 } from "./workbench-controls";
 import {
+  type AgentExportJob,
   type AgentToolCtx,
   runStudioTool as runAgentStudioTool,
   runExternalTool as runAgentExternalTool,
@@ -1743,6 +1754,26 @@ export function HyperframesWorkbench({
     })();
     return () => { cancelled = true; };
   }, [editorDocument, localAssetIndexRev, prepareLocalAssetRuntime, resolveAssetUrl, setEditorDocument]);
+  /** Export-time readiness: the same restore as the effect above, awaited. An output switch clears the
+   *  runtime and the effect restores it asynchronously; an export started in between (batch export,
+   *  an agent's export right after switch_output) must not read a plan with unresolved sources. */
+  const prepareExportAssets = useCallback(
+    async (document: EditorDocumentV2) => {
+      const referenced = new Set(
+        document.timeline.tracks.flatMap((track) =>
+          track.clips.flatMap((clip) => ("assetId" in clip && clip.assetId ? [clip.assetId] : [])),
+        ),
+      );
+      for (const assetId of referenced) {
+        const asset = document.assets[assetId];
+        if (!asset?.locator.localSig || asset.kind === "image") continue;
+        if (localRuntimeReadyAssetIdsRef.current.has(asset.id)) continue;
+        const result = await prepareLocalAssetRuntime(asset, { asPrimary: false });
+        if (!result.ok) console.warn(`[studio] export: local ${asset.kind} source not ready for ${asset.id}: ${result.error}`);
+      }
+    },
+    [prepareLocalAssetRuntime],
+  );
   // Persistence metadata is folded into V2 synchronously without coupling the live-document module
   // to workbench feature refs.
   livePersistenceMetadataRef.current = {
@@ -1813,16 +1844,11 @@ export function HyperframesWorkbench({
     clipFilesRef,
     audioExportRef,
     denoiseExportRef,
+    prepareExportAssets,
   });
   // Agent export task (export_video/track_export): compose + browser download runs via exportVideo, this only tracks task state;
   // exportPct mirrored into a ref for the progress query inside runStudioTool (the switch closure can't read state)
-  const agentExportRef = useRef<{
-    running: boolean;
-    filename: string | null;
-    error: string | null;
-    delivered?: "local_sink" | "browser_download";
-    sinkError?: string;
-  }>({
+  const agentExportRef = useRef<AgentExportJob>({
     running: false,
     filename: null,
     error: null,
@@ -5714,6 +5740,34 @@ export function HyperframesWorkbench({
     pushUndoSnapshot,
   });
   audioExportRef.current = audioOps.audioForExport;
+  // Word masks (beeped / muted words): narrative sources are keyed by src in the engine; audio-lane and
+  // visual-lane clips carry theirs inside their engine specs, which are re-fed here since masks live on
+  // the document, outside the audio hook's own deps.
+  const engineMaskKeysRef = useRef<Set<string>>(new Set());
+  const engineMaskSigRef = useRef('');
+  useEffect(() => {
+    const eng = videoEngineRef.current;
+    if (!eng) return;
+    const masks = previewAudioMasks(editorDocument, comp);
+    if ((window as unknown as { __hfMaskDebug?: boolean }).__hfMaskDebug) {
+      console.info('[mask:doc]', {
+        maskedClips: [...clipAudioMasks(editorDocument).keys()],
+        narrationKeys: [...masks.keys()].map((k) => k.slice(0, 60)),
+        shots: videoTrackShots(comp).map((shot) => `${shot.id}:${(shot.src ?? 'main').slice(0, 40)}`),
+        visuals: supplementalVisuals.map((visual) => `${visual.clipId}:${visual.kind}:${visual.muted ? 'muted' : 'audible'}`),
+        audioClips: (comp.audioTracks ?? []).map((clip) => clip.id),
+      });
+    }
+    for (const key of engineMaskKeysRef.current) if (!masks.has(key)) eng.setAudioMasks(key, []);
+    for (const [key, ranges] of masks) eng.setAudioMasks(key, ranges);
+    engineMaskKeysRef.current = new Set(masks.keys());
+    const clipSig = JSON.stringify([...clipAudioMasks(editorDocument)]);
+    if (clipSig !== engineMaskSigRef.current) {
+      engineMaskSigRef.current = clipSig;
+      audioOps.resyncEngineClips();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editorDocument, comp]);
   /** Switch the rail to the audio settings tab (expanding the rail if the user had collapsed it). */
   const openAudioTab = () => {
     setFloatWin(null);
@@ -6843,10 +6897,102 @@ export function HyperframesWorkbench({
     })),
   ].sort((a, b) => a.order - b.order || a.createdAt - b.createdAt);
   const switchOutput = (id: string) => {
+    // A switch resets the editor and drops the source file under a running render.
+    if (exporting || publishing || agentExportRef.current.running) {
+      toast.info(t("workbench.switchBlockedByExport"));
+      return;
+    }
     void outputRuntime.switchOutput(id);
   };
   const createOutput = () => {
     outputRuntime.createOutput("");
+  };
+  // ---- Batch export (export button "more" menu): sequential switch→export over picked outputs ----
+  const [batchExportOpen, setBatchExportOpen] = useState(false);
+  const [batchSelected, setBatchSelected] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [outputBatch, setOutputBatch] = useState<OutputBatchState | null>(null);
+  const outputBatchCancelRef = useRef(false);
+  // The batch loop spans many renders (each switch/export re-renders); refs keep it reading the
+  // CURRENT callbacks/state instead of the closures captured when the loop started.
+  const activeOutputIdRef = useRef(projectOutputs.outputs.active.id);
+  activeOutputIdRef.current = projectOutputs.outputs.active.id;
+  const switchOutputFnRef = useRef(outputRuntime.switchOutput);
+  switchOutputFnRef.current = outputRuntime.switchOutput;
+  const exportVideoFnRef = useRef(exportVideo);
+  exportVideoFnRef.current = exportVideo;
+  // A version with no duration is empty (no video / no content) and is never part of a batch export.
+  const batchExportableOutputs = outputTabs.filter((o) => o.durationSec);
+  const openBatchExport = () => {
+    if (outputBatch?.running || exporting || publishing) return;
+    setOutputBatch(null);
+    setBatchSelected(new Set(batchExportableOutputs.map((o) => o.id)));
+    setBatchExportOpen(true);
+  };
+  const toggleBatchSelect = (id: string) => {
+    setBatchSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const toggleBatchSelectAll = (all: boolean) => {
+    setBatchSelected(
+      new Set(all ? batchExportableOutputs.map((o) => o.id) : []),
+    );
+  };
+  const startBatchExport = () => {
+    const ids = batchExportableOutputs
+      .filter((o) => batchSelected.has(o.id))
+      .map((o) => o.id);
+    if (!ids.length || outputBatch?.running || exporting || publishing) return;
+    outputBatchCancelRef.current = false;
+    setPlaying(false);
+    setOutputBatch({
+      running: true,
+      total: ids.length,
+      done: 0,
+      currentId: null,
+      doneIds: [],
+      failedIds: [],
+    });
+    const opts = exportOpts;
+    void (async () => {
+      const doneIds: string[] = [];
+      const failedIds: string[] = [];
+      for (const id of ids) {
+        if (outputBatchCancelRef.current) break;
+        setOutputBatch((s) => (s ? { ...s, currentId: id } : s));
+        let ok =
+          id === activeOutputIdRef.current ||
+          (await switchOutputFnRef.current(id));
+        if (outputBatchCancelRef.current) break;
+        if (ok) {
+          const r = await exportVideoFnRef.current(opts);
+          if (outputBatchCancelRef.current && !r.ok) break; // canceled mid-render: don't count it as failed
+          ok = !!r.ok;
+        }
+        (ok ? doneIds : failedIds).push(id);
+        setOutputBatch((s) =>
+          s
+            ? {
+                ...s,
+                done: doneIds.length + failedIds.length,
+                currentId: null,
+                doneIds: [...doneIds],
+                failedIds: [...failedIds],
+              }
+            : s,
+        );
+      }
+      setOutputBatch((s) => (s ? { ...s, running: false, currentId: null } : s));
+    })();
+  };
+  const cancelBatchExport = () => {
+    outputBatchCancelRef.current = true;
+    cancelExport();
   };
   const requestDeleteOutput = (id: string) => {
     const output = outputTabs.find((item) => item.id === id);
@@ -6925,6 +7071,8 @@ export function HyperframesWorkbench({
     cutTimelineRanges,
     restoreSrcRanges,
     replaceScriptWord,
+    maskScriptWords,
+    maskTimelineScriptWords,
     replaceTimelineScriptWord,
     extractForScript,
     asrBusy,
@@ -9944,6 +10092,7 @@ export function HyperframesWorkbench({
                         onCut={cutSrcRanges}
                         onRestore={restoreSrcRanges}
                         onReplaceWord={replaceScriptWord}
+                        onMaskWords={maskScriptWords}
                       />
                     ) : (
                       <TimelineScriptPanel
@@ -9956,6 +10105,7 @@ export function HyperframesWorkbench({
                         }}
                         onCut={cutTimelineRanges}
                         onReplaceWord={replaceTimelineScriptWord}
+                        onMaskWords={maskTimelineScriptWords}
                       />
                     )}
                   </div>
@@ -10095,6 +10245,7 @@ export function HyperframesWorkbench({
                           onCut={cutSrcRanges}
                           onRestore={restoreSrcRanges}
                           onReplaceWord={replaceScriptWord}
+                        onMaskWords={maskScriptWords}
                         />
                       ) : (
                         <TimelineScriptPanel
@@ -10107,6 +10258,7 @@ export function HyperframesWorkbench({
                           }}
                           onCut={cutTimelineRanges}
                           onReplaceWord={replaceTimelineScriptWord}
+                        onMaskWords={maskTimelineScriptWords}
                         />
                       )
                     )}
@@ -10695,28 +10847,73 @@ export function HyperframesWorkbench({
               edge IS the visible edge and nothing can show through beside the button; bg-panel matches
               the column surface, masking buttons that pass underneath without a visible block. */}
             <div className="sticky right-0 z-10 ml-auto flex shrink-0 items-center gap-3 bg-panel pl-2 pr-4">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    onClick={() => setExportOpen(true)}
-                    disabled={exporting || publishing || !hasContent}
-                    className="border-line text-ink-2 hover:text-ink inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[12px] disabled:opacity-50"
+              {/* Split button like the asset panel's import control: main half exports the active
+                output, the attached "more" half opens batch export over the project's outputs. */}
+              <div className="flex shrink-0 items-center">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={() => setExportOpen(true)}
+                      disabled={exporting || publishing || !hasContent}
+                      className="border-line text-ink-2 hover:text-ink inline-flex shrink-0 items-center gap-1.5 rounded-l-md border px-2.5 py-1.5 text-[12px] disabled:opacity-50"
+                    >
+                      {exporting || publishing ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : (
+                        <FileVideo size={14} />
+                      )}{" "}
+                      {exporting
+                        ? t("workbench.exportingPctShort", { pct: exportPct })
+                        : publishing
+                          ? t("workbench.renderingPct", { pct: exportPct })
+                          : t("workbench.export")}
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent>{t("tools.export_video.label")}</TooltipContent>
+                </Tooltip>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      disabled={exporting || publishing}
+                      title={t("workbench.moreExportOptions")}
+                      aria-label={t("workbench.moreExportOptions")}
+                      className="border-line text-ink-3 hover:text-ink -ml-px inline-flex shrink-0 items-center justify-center self-stretch rounded-r-md border px-1.5 disabled:opacity-50 data-[state=open]:text-ink"
+                    >
+                      <MoreHorizontal size={13} />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    align="end"
+                    sideOffset={5}
+                    className="min-w-[140px] text-[12px]"
                   >
-                    {exporting || publishing ? (
-                      <Loader2 size={14} className="animate-spin" />
-                    ) : (
-                      <FileVideo size={14} />
-                    )}{" "}
-                    {exporting
-                      ? t("workbench.exportingPctShort", { pct: exportPct })
-                      : publishing
-                        ? t("workbench.renderingPct", { pct: exportPct })
-                        : t("workbench.export")}
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent>{t("tools.export_video.label")}</TooltipContent>
-              </Tooltip>
+                    <DropdownMenuItem
+                      disabled={!batchExportableOutputs.length}
+                      onSelect={openBatchExport}
+                      className="text-[12px]"
+                    >
+                      <Layers size={13} />
+                      {t("workbench.batchExport")}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+              <BatchExportDialog
+                open={batchExportOpen}
+                onOpenChange={setBatchExportOpen}
+                outputs={batchExportableOutputs}
+                selected={batchSelected}
+                onToggleSelect={toggleBatchSelect}
+                onToggleAll={toggleBatchSelectAll}
+                opts={exportOpts}
+                onOptsChange={setExportOpts}
+                batch={outputBatch}
+                exportPct={exportPct}
+                onStart={startBatchExport}
+                onCancel={cancelBatchExport}
+              />
               <Dialog
                 open={exportOpen}
                 onOpenChange={(v) => {
